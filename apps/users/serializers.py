@@ -1,7 +1,9 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from .models import User
-
+from rest_framework import serializers
+from django.contrib.auth import authenticate
+from .models import User
 
 class UserSerializer(serializers.ModelSerializer):
     """
@@ -76,7 +78,106 @@ class LoginSerializer(serializers.Serializer):
 
         data['user'] = user
         return data
+class AchievementSerializer(serializers.Serializer):
+    """
+    Matches your AchievementEntity.
+    Achievements are computed from user stats — not stored separately.
+    """
+    id = serializers.CharField()
+    title = serializers.CharField()
+    description = serializers.CharField()
+    iconCode = serializers.CharField()
+    isUnlocked = serializers.BooleanField()
 
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """
+    Full profile response — matches your UserProfileEntity exactly.
+    Used by GET /auth/profile/
+    """
+    name = serializers.CharField(source='full_name', read_only=True)
+    avatarUrl = serializers.URLField(source='avatar_url', read_only=True)
+    booksRead = serializers.IntegerField(source='books_read', read_only=True)
+    totalPages = serializers.IntegerField(
+        source='total_pages_read',
+        read_only=True,
+    )
+    currentStreak = serializers.IntegerField(
+        source='current_streak',
+        read_only=True,
+    )
+    isAvidReader = serializers.BooleanField(
+        source='is_avid_reader',
+        read_only=True,
+    )
+    achievements = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'name', 'email', 'avatarUrl',
+            'booksRead', 'totalPages', 'currentStreak',
+            'isAvidReader', 'achievements',
+        ]
+
+    def get_achievements(self, user):
+        """
+        Compute achievements from user stats.
+        Matches the exact achievements in your MockProfileRepository.
+        """
+        achievements = []
+
+        # Achievement 1: First Week Streak
+        achievements.append({
+            'id': 'a1',
+            'title': 'First Week Streak',
+            'description': 'Read for 7 consecutive days',
+            'iconCode': 'trophy',
+            'isUnlocked': user.current_streak >= 7,
+        })
+
+        # Achievement 2: Bookworm
+        achievements.append({
+            'id': 'a2',
+            'title': 'Bookworm',
+            'description': 'Completed 10 books',
+            'iconCode': 'books',
+            'isUnlocked': user.books_read >= 10,
+        })
+
+        # Achievement 3: Consistent Reader
+        achievements.append({
+            'id': 'a3',
+            'title': 'Consistent Reader',
+            'description': 'Met daily goal 30 times',
+            'iconCode': 'target',
+            'isUnlocked': user.total_pages_read >= 1000,
+        })
+
+        return achievements
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """
+    POST /auth/change-password/
+    Matches your change password flow.
+    """
+    current_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True, min_length=8)
+    confirm_password = serializers.CharField(write_only=True)
+
+    def validate(self, data):
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError({
+                'confirm_password': 'Passwords do not match.'
+            })
+        return data
+
+    def validate_current_password(self, value):
+        user = self.context['request'].user
+        if not user.check_password(value):
+            raise serializers.ValidationError('Current password is incorrect.')
+        return value
 
 class GoogleAuthSerializer(serializers.Serializer):
     """

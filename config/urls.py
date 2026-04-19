@@ -7,4 +7,5 @@ urlpatterns = [
     path('api/v1/books/', include('apps.books.urls')),
     path('api/v1/library/', include('apps.library.urls')),
     path('api/v1/reading/', include('apps.reading.urls')),
+    path('api/v1/discussions/', include('apps.discussions.urls')),  
 ]

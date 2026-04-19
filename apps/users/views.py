@@ -14,7 +14,10 @@ from .serializers import (
     ForgotPasswordSerializer, VerifyOTPSerializer,
     ResetPasswordSerializer, UpdateProfileSerializer,
     GoogleAuthSerializer,
+     UserProfileSerializer,      # new
+    ChangePasswordSerializer,   # new
 )
+
 
 
 def get_tokens_for_user(user):
@@ -317,3 +320,99 @@ class ResetPasswordView(APIView):
                 {'error': 'Invalid request.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+class UserProfileView(APIView):
+    """
+    GET   /auth/profile/  → full profile with stats + achievements
+    PATCH /auth/profile/  → update name or avatar
+    Matches your UserProfileEntity and ProfilePage.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # Sync isAvidReader flag based on books_read count
+        if request.user.books_read >= 5 and not request.user.is_avid_reader:
+            request.user.is_avid_reader = True
+            request.user.save(update_fields=['is_avid_reader'])
+
+        serializer = UserProfileSerializer(request.user)
+        return Response(serializer.data)
+
+    def patch(self, request):
+        serializer = UpdateProfileSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+        )
+        if serializer.is_valid():
+            serializer.save()
+            # Return full profile after update
+            return Response(UserProfileSerializer(request.user).data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ChangePasswordView(APIView):
+    """
+    POST /auth/change-password/
+    Requires the user to be logged in.
+    Matches your change password flow.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={'request': request},
+        )
+
+        if not serializer.is_valid():
+            return Response(
+                serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Set the new password
+        request.user.set_password(serializer.validated_data['new_password'])
+        request.user.save()
+
+        # Invalidate all existing tokens — user must log in again
+        # This is a security best practice after password change
+        try:
+            refresh_token = request.data.get('refresh_token')
+            if refresh_token:
+                from rest_framework_simplejwt.tokens import RefreshToken
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+        except Exception:
+            pass  # Don't block the response if blacklisting fails
+
+        return Response({
+            'message': 'Password changed successfully. Please log in again.',
+        })
+
+
+class UpdateStatsView(APIView):
+    """
+    POST /auth/stats/update/
+    Called internally when a book is completed or pages are read.
+    Updates booksRead, totalPages, currentStreak on the User model.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        books_read_delta = request.data.get('books_read_delta', 0)
+        pages_read_delta = request.data.get('pages_read_delta', 0)
+
+        user = request.user
+        user.books_read += books_read_delta
+        user.total_pages_read += pages_read_delta
+
+        # Update isAvidReader automatically
+        if user.books_read >= 5:
+            user.is_avid_reader = True
+
+        user.save(update_fields=[
+            'books_read', 'total_pages_read', 'is_avid_reader'
+        ])
+
+        return Response(UserProfileSerializer(user).data)

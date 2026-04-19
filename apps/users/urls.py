@@ -12,11 +12,18 @@ urlpatterns = [
     # Token management
     path('token/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
 
-    # Profile
+    # Basic identity
     path('me/', views.MeView.as_view(), name='me'),
 
-    # Password reset flow (matches your 3-screen flow)
+    # Full profile with stats + achievements (this is what Flutter calls)
+    path('profile/', views.UserProfileView.as_view(), name='profile'),
+
+    # Password management
+    path('change-password/', views.ChangePasswordView.as_view(), name='change-password'),
     path('forgot-password/', views.ForgotPasswordView.as_view(), name='forgot-password'),
     path('verify-otp/', views.VerifyOTPView.as_view(), name='verify-otp'),
     path('reset-password/', views.ResetPasswordView.as_view(), name='reset-password'),
+
+    # Stats update
+    path('stats/update/', views.UpdateStatsView.as_view(), name='update-stats'),
 ]
