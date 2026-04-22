@@ -130,7 +130,7 @@ class CurrentProgressView(APIView):
         if not user_book:
             return Response(
                 {'error': 'No book currently in progress.'},
-                status=status.HTTP_404_NOT_FOUND
+                status=status.HTTP_200_OK
             )
 
         serializer = UserProgressSerializer(user_book)
