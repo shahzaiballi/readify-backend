@@ -9,7 +9,7 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1').split(',')
 
-# Apps
+# ── Apps ────────────────────────────────────────────────────────────────────
 DJANGO_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -24,6 +24,7 @@ THIRD_PARTY_APPS = [
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
+    'django_celery_results',
 ]
 
 LOCAL_APPS = [
@@ -38,7 +39,7 @@ INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    'corsheaders.middleware.CorsMiddleware',  # Must be near the top
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -67,7 +68,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-# Database
+# ── Database ─────────────────────────────────────────────────────────────────
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql',
@@ -79,10 +80,10 @@ DATABASES = {
     }
 }
 
-# Custom User Model — tells Django to use our User, not its default one
+# ── Custom User Model ─────────────────────────────────────────────────────────
 AUTH_USER_MODEL = 'users.User'
 
-# Password validation
+# ── Password Validation ───────────────────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
     {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
@@ -95,13 +96,18 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+# ── Static & Media Files ──────────────────────────────────────────────────────
+STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Media files — user and admin uploaded PDFs, cover images
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# ─── DRF Settings ──────────────────────────────────────────
+# ── DRF Settings ──────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
-    # All endpoints require login by default
-    # Public endpoints will override this individually
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
@@ -112,18 +118,42 @@ REST_FRAMEWORK = {
     'PAGE_SIZE': 20,
 }
 
-# ─── JWT Settings ───────────────────────────────────────────
+# ── JWT Settings ──────────────────────────────────────────────────────────────
 from datetime import timedelta
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),  # increased for dev convenience
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
-    'ROTATE_REFRESH_TOKENS': True,       # New refresh token on every refresh
-    'BLACKLIST_AFTER_ROTATION': True,    # Old tokens become invalid
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'UPDATE_LAST_LOGIN': True,
 }
 
-# ─── CORS ───────────────────────────────────────────────────
-# During development, allow all origins (Flutter dev server / emulator)
+# ── CORS ──────────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
+
+# ── Celery ────────────────────────────────────────────────────────────────────
+# Redis is used as the message broker for background tasks.
+# Install Redis locally: https://redis.io/docs/getting-started/
+# On Mac: brew install redis && brew services start redis
+# On Ubuntu: sudo apt install redis-server && sudo systemctl start redis
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = 'django-db'  # stores results in PostgreSQL (django_celery_results)
+CELERY_CACHE_BACKEND = 'default'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+
+# ── Anthropic (Claude) API ────────────────────────────────────────────────────
+ANTHROPIC_API_KEY = config('ANTHROPIC_API_KEY', default='')
+
+# ── PDF Upload Settings ───────────────────────────────────────────────────────
+# Max PDF size: 50MB (matches your Flutter AddBookPage UI text)
+PDF_MAX_UPLOAD_SIZE_MB = 50
+MAX_CHUNK_WORDS = 300     # ~2 minutes reading at average pace
+MIN_CHUNK_WORDS = 50      # don't create tiny chunks
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID = config('GOOGLE_CLIENT_ID', default='')
