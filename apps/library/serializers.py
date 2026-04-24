@@ -12,7 +12,7 @@ class LibraryBookSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(source='book.id')
     title = serializers.CharField(source='book.title')
     author = serializers.CharField(source='book.author')
-    imageUrl = serializers.URLField(source='book.cover_image_url')
+    imageUrl = serializers.SerializerMethodField()  # Use method field like BookListSerializer
     rating = serializers.DecimalField(
         source='book.rating',
         max_digits=3,
@@ -21,7 +21,7 @@ class LibraryBookSerializer(serializers.ModelSerializer):
     readersCount = serializers.SerializerMethodField()
     category = serializers.CharField(source='book.category')
     hasAudio = serializers.BooleanField(source='book.has_audio')
-    badge = serializers.CharField(source='book.badge')
+    badge = serializers.CharField(source='book.badge', allow_null=True)
 
     # Library-specific fields
     progressPercent = serializers.IntegerField(source='progress_percent')
@@ -35,6 +35,15 @@ class LibraryBookSerializer(serializers.ModelSerializer):
             'hasAudio', 'badge',
             'progressPercent', 'isFavorite', 'status',
         ]
+
+    def get_imageUrl(self, obj):
+        """Get the cover image URL, supporting both uploaded files and URL strings."""
+        request = self.context.get('request')
+        url = obj.book.get_cover_url()
+        # If it's a relative path from an uploaded file, make it absolute
+        if url and not url.startswith('http') and request:
+            return request.build_absolute_uri(url)
+        return url or ''
 
     def get_readersCount(self, obj):
         return obj.book.formatted_readers_count()
@@ -78,9 +87,18 @@ class UserProgressSerializer(serializers.ModelSerializer):
     bookId = serializers.UUIDField(source='book.id')
     title = serializers.CharField(source='book.title')
     author = serializers.CharField(source='book.author')
-    imageUrl = serializers.URLField(source='book.cover_image_url')
+    imageUrl = serializers.SerializerMethodField()  # Use method field to handle all cases
     progressPercent = serializers.IntegerField(source='progress_percent')
 
     class Meta:
         model = UserBook
         fields = ['bookId', 'title', 'author', 'imageUrl', 'progressPercent']
+
+    def get_imageUrl(self, obj):
+        """Get the cover image URL, supporting both uploaded files and URL strings."""
+        request = self.context.get('request')
+        url = obj.book.get_cover_url()
+        # If it's a relative path from an uploaded file, make it absolute
+        if url and not url.startswith('http') and request:
+            return request.build_absolute_uri(url)
+        return url or ''

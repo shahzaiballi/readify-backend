@@ -38,7 +38,7 @@ class LibraryView(APIView):
         if favorite == 'true':
             user_books = user_books.filter(is_favorite=True)
 
-        serializer = LibraryBookSerializer(user_books, many=True)
+        serializer = LibraryBookSerializer(user_books, many=True, context={'request': request})
         return Response(serializer.data)
 
     def post(self, request):
@@ -63,7 +63,7 @@ class LibraryView(APIView):
             )
 
         return Response(
-            LibraryBookSerializer(user_book).data,
+            LibraryBookSerializer(user_book, context={'request': request}).data,
             status=status.HTTP_201_CREATED
         )
 
@@ -97,7 +97,7 @@ class LibraryBookDetailView(APIView):
         )
         if serializer.is_valid():
             serializer.save()
-            return Response(LibraryBookSerializer(user_book).data)
+            return Response(LibraryBookSerializer(user_book, context={'request': request}).data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     def delete(self, request, pk):
@@ -117,6 +117,8 @@ class CurrentProgressView(APIView):
     GET /reading/progress/
     Returns the book the user is currently reading.
     Matches your currentProgressProvider and CurrentlyReadingCard.
+    
+    Returns 404 if no book is currently in progress.
     """
     permission_classes = [IsAuthenticated]
 
@@ -129,9 +131,9 @@ class CurrentProgressView(APIView):
 
         if not user_book:
             return Response(
-                {'error': 'No book currently in progress.'},
-                status=status.HTTP_200_OK
+                {'detail': 'No book currently in progress.'},
+                status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = UserProgressSerializer(user_book)
+        serializer = UserProgressSerializer(user_book, context={'request': request})
         return Response(serializer.data)
