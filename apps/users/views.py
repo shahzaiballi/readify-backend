@@ -34,7 +34,7 @@ def get_tokens_for_user(user):
 
 class RegisterView(APIView):
     """
-    POST /auth/register/
+    POST /api/v1/auth/register/
     Matches your SignUpPage — creates account, returns tokens immediately
     so the user doesn't have to log in separately after registering.
     """
@@ -58,7 +58,7 @@ class RegisterView(APIView):
 
 class LoginView(APIView):
     """
-    POST /auth/login/
+    POST /api/v1/auth/login/
     Matches your LoginPage — email + password → tokens
     """
     permission_classes = [AllowAny]
@@ -80,7 +80,7 @@ class LoginView(APIView):
 
 class GoogleAuthView(APIView):
     """
-    POST /auth/google/
+    POST /api/v1/auth/google/
     Flutter sends the Google ID token.
     We verify it and either find or create the user.
     """
@@ -144,7 +144,7 @@ class GoogleAuthView(APIView):
 
 class LogoutView(APIView):
     """
-    POST /auth/logout/
+    POST /api/v1/auth/logout/
     Blacklists the refresh token so it can't be reused.
     """
     permission_classes = [IsAuthenticated]
@@ -171,8 +171,8 @@ class LogoutView(APIView):
 
 class MeView(APIView):
     """
-    GET  /auth/me/  → returns current user profile
-    PATCH /auth/me/ → update name, avatar
+    GET  /api/v1/auth/me/  → returns current user profile
+    PATCH /api/v1/auth/me/ → update name, avatar
     """
     permission_classes = [IsAuthenticated]
 
@@ -194,7 +194,7 @@ class MeView(APIView):
 
 class ForgotPasswordView(APIView):
     """
-    POST /auth/forgot-password/
+    POST /api/v1/auth/forgot-password/
     Matches your ForgotPasswordPage — sends 4-digit OTP to email.
     """
     permission_classes = [AllowAny]
@@ -237,7 +237,7 @@ class ForgotPasswordView(APIView):
 
 class VerifyOTPView(APIView):
     """
-    POST /auth/verify-otp/
+    POST /api/v1/auth/verify-otp/
     Matches your OtpVerificationPage — validates the 4-digit code.
     """
     permission_classes = [AllowAny]
@@ -276,7 +276,7 @@ class VerifyOTPView(APIView):
 
 class ResetPasswordView(APIView):
     """
-    POST /auth/reset-password/
+    POST /api/v1/auth/reset-password/
     Called after OTP is verified — sets the new password.
     """
     permission_classes = [AllowAny]
@@ -323,8 +323,8 @@ class ResetPasswordView(APIView):
         
 class UserProfileView(APIView):
     """
-    GET   /auth/profile/  → full profile with stats + achievements
-    PATCH /auth/profile/  → update name or avatar
+    GET   /api/v1/auth/profile/  → full profile with stats + achievements
+    PATCH /api/v1/auth/profile/  → update name or avatar
     Matches your UserProfileEntity and ProfilePage.
     """
     permission_classes = [IsAuthenticated]
@@ -353,7 +353,7 @@ class UserProfileView(APIView):
 
 class ChangePasswordView(APIView):
     """
-    POST /auth/change-password/
+    POST /api/v1/auth/change-password/
     Requires the user to be logged in.
     Matches your change password flow.
     """
@@ -393,7 +393,7 @@ class ChangePasswordView(APIView):
 
 class UpdateStatsView(APIView):
     """
-    POST /auth/stats/update/
+    POST /api/v1/auth/stats/update/
     Called internally when a book is completed or pages are read.
     Updates booksRead, totalPages, currentStreak on the User model.
     """

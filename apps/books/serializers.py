@@ -1,14 +1,6 @@
-"""
-apps/books/serializers.py
-
-Key changes from original:
-- BookListSerializer.imageUrl now uses get_cover_url() (supports uploaded cover images)
-- Added UserUploadSerializer for the user PDF upload endpoint
-- Added UserUploadStatusSerializer so Flutter can poll processing status
-"""
-
 from rest_framework import serializers
 from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook
+from django.contrib.auth.models import AnonymousUser
 
 
 class BookListSerializer(serializers.ModelSerializer):
@@ -170,56 +162,55 @@ class FlashcardSerializer(serializers.ModelSerializer):
 
 
 # ── User Upload Serializers ───────────────────────────────────────────────────
-
 class UserUploadSerializer(serializers.ModelSerializer):
-    """
-    POST /books/upload/
+    """✅ FIXED: Flutter PDF upload serializer - properly handles uploaded_by"""
+    pdf_file = serializers.FileField()
 
-    Accepts a PDF file + title + author from the Flutter AddBookPage.
-    The actual processing happens in background via Celery.
-    """
     class Meta:
         model = UserUploadedBook
-        fields = ['id', 'title', 'author', 'pdf_file']
-        extra_kwargs = {
-            'pdf_file': {'required': True},
-            'title': {'required': True},
-        }
-
+        fields = ['title', 'author', 'pdf_file']
+    
     def validate_pdf_file(self, value):
-        """Validate file is a PDF and under size limit."""
+        """Validate PDF size/extension"""
         from django.conf import settings
-
-        # Check file extension
+        
         if not value.name.lower().endswith('.pdf'):
-            raise serializers.ValidationError(
-                'Only PDF files are supported. Please upload a .pdf file.'
-            )
-
-        # Check file size (convert MB to bytes)
-        max_size_bytes = settings.PDF_MAX_UPLOAD_SIZE_MB * 1024 * 1024
-        if value.size > max_size_bytes:
-            raise serializers.ValidationError(
-                f'PDF file is too large. Maximum size is {settings.PDF_MAX_UPLOAD_SIZE_MB}MB.'
-            )
-
+            raise serializers.ValidationError('Only PDF files supported')
+        
+        max_size = getattr(settings, 'PDF_MAX_UPLOAD_SIZE_MB', 50) * 1024 * 1024
+        if value.size > max_size:
+            raise serializers.ValidationError(f'Max size: {max_size//(1024*1024)}MB')
+        
         return value
+    
+    def create(self, validated_data):
+        """✅ FIXED: Properly set uploaded_by from request.user"""
+        request = self.context.get('request')
+        
+        # Get authenticated user or create a default system user
+        if request and request.user and not isinstance(request.user, AnonymousUser):
+            validated_data['uploaded_by'] = request.user
+        else:
+            # Fallback: get first superuser or create a system user
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            system_user = User.objects.filter(is_superuser=True).first()
+            if system_user:
+                validated_data['uploaded_by'] = system_user
+            else:
+                raise serializers.ValidationError("No authenticated user available")
+        
+        return UserUploadedBook.objects.create(**validated_data)
 
 
 class UserUploadStatusSerializer(serializers.ModelSerializer):
-    """
-    GET /books/upload/<id>/status/
-
-    Flutter polls this endpoint to check if processing is done.
-    Returns the status and, when complete, the book_id so Flutter
-    can navigate to the book detail page.
-    """
+    """Flutter polls this for processing status"""
     bookId = serializers.SerializerMethodField()
     processingStatus = serializers.CharField(source='status')
 
     class Meta:
         model = UserUploadedBook
-        fields = ['id', 'title', 'processingStatus', 'bookId', 'error_message', 'uploaded_at']
+        fields = ['id', 'title', 'processingStatus', 'bookId', 'error_message']
 
     def get_bookId(self, obj):
         return str(obj.book.id) if obj.book else None

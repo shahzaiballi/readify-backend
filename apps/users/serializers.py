@@ -112,7 +112,7 @@ class AchievementSerializer(serializers.Serializer):
 class UserProfileSerializer(serializers.ModelSerializer):
     """
     Full profile response — matches UserProfileEntity exactly.
-    Used by GET /auth/profile/
+    Used by GET /api/v1/auth/profile/
     """
     name = serializers.CharField(source='full_name', read_only=True)
     avatarUrl = serializers.SerializerMethodField()
@@ -168,7 +168,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class ChangePasswordSerializer(serializers.Serializer):
-    """POST /auth/change-password/"""
+    """POST /api/v1/auth/change-password/"""
     current_password = serializers.CharField(write_only=True)
     new_password = serializers.CharField(write_only=True, min_length=8)
     confirm_password = serializers.CharField(write_only=True)
@@ -215,7 +215,7 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 
 class UpdateProfileSerializer(serializers.ModelSerializer):
-    """For PATCH /auth/me/ and PATCH /auth/profile/"""
+    """For PATCH /api/v1/auth/me/ and PATCH /api/v1/auth/profile/"""
     class Meta:
         model = User
         fields = ['full_name', 'avatar_url']
