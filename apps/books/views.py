@@ -156,35 +156,94 @@ class BookFlashcardsView(APIView):
 
 
 # ── User Upload Views ─────────────────────────────────────────────────────────
+
 class UserBookUploadView(APIView):
-    """✅ FIXED: PDF upload from Flutter - passes request context"""
+    """
+    POST /books/upload/
+
+    ✅ FIXED: This view now creates a Book record FIRST, then links it to the
+    UserUploadedBook record, then queues the Celery task.
+
+    The old bug was: UserUploadedBook was created but upload.book was None,
+    so the Celery task logged "No book linked to upload" and exited immediately.
+    """
     parser_classes = [MultiPartParser, FormParser]
-    permission_classes = [IsAuthenticated]  # ✅ CHANGED: Now requires auth
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        logger.info(f"📤 UPLOAD HIT! User: {request.user}, Files: {request.FILES}, Data: {request.data}")
-        
-        # ✅ Pass request context to serializer so it can access user
+        logger.info(
+            f"📤 UPLOAD HIT! User: {request.user}, "
+            f"Files: {list(request.FILES.keys())}, "
+            f"Data: {dict(request.data)}"
+        )
+
         serializer = UserUploadSerializer(data=request.data, context={'request': request})
-        if serializer.is_valid():
-            upload = serializer.save()  # ✅ Now properly sets uploaded_by
-            
-            # Queue Celery processing
-            process_user_uploaded_book.delay(str(upload.id))
-            
-            logger.info(f"✅ Upload created ID: {upload.id} by user: {request.user}")
-            return Response({
-                'message': '✅ Upload accepted - processing...',
+
+        if not serializer.is_valid():
+            logger.error(f"❌ Upload validation errors: {serializer.errors}")
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Step 1: Create the placeholder Book record ──────────────────────
+        # This is what was MISSING before. The Celery task needs upload.book
+        # to exist so it knows where to save processed chapters/chunks.
+        title = serializer.validated_data['title']
+        author = serializer.validated_data.get('author', '')
+
+        book = Book.objects.create(
+            title=title,
+            author=author or 'Unknown Author',
+            category='User Upload',
+            source=Book.Source.USER_UPLOAD,
+            processing_status=Book.ProcessingStatus.PENDING,
+            is_published=True,   # Visible to the owning user
+            is_recommended=False,
+            is_trending=False,
+            description=f'Uploaded by {request.user.email}',
+            # Cover will be blank for now; AI task can set it later if needed
+        )
+        logger.info(f"📚 Created placeholder Book: {book.id} — '{book.title}'")
+
+        # ── Step 2: Create UserUploadedBook and link the Book ────────────────
+        upload = UserUploadedBook.objects.create(
+            uploaded_by=request.user,
+            title=title,
+            author=author,
+            pdf_file=serializer.validated_data['pdf_file'],
+            book=book,                          # ✅ Link created here
+            status=UserUploadedBook.Status.PENDING,
+        )
+        logger.info(f"📄 Created UserUploadedBook: {upload.id}, book={book.id}")
+
+        # ── Step 3: Add the book to the user's library immediately ──────────
+        # This way it appears in the frontend library straight away (as
+        # "not_started") even before AI processing finishes.
+        from apps.library.models import UserBook
+        user_book, created = UserBook.objects.get_or_create(
+            user=request.user,
+            book=book,
+            defaults={'status': UserBook.Status.NOT_STARTED},
+        )
+        logger.info(
+            f"📖 UserBook {'created' if created else 'already existed'}: "
+            f"user={request.user.email}, book={book.id}"
+        )
+
+        # ── Step 4: Queue the Celery background task ─────────────────────────
+        process_user_uploaded_book.delay(str(upload.id))
+        logger.info(f"⚙️  Celery task queued for upload {upload.id}")
+
+        return Response(
+            {
+                'message': '✅ Upload accepted — AI processing started.',
                 'id': str(upload.id),
-                'upload_url': request.build_absolute_uri(upload.pdf_file.url)
-            }, status=status.HTTP_202_ACCEPTED)
-        
-        logger.error(f"❌ Upload errors: {serializer.errors}")
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+                'book_id': str(book.id),
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class UserUploadStatusView(APIView):
-    """GET /books/upload/<id>/status/ - Flutter polls this"""
+    """GET /books/upload/<id>/status/ — Flutter polls this"""
     permission_classes = [AllowAny]
 
     def get(self, request, upload_id):
