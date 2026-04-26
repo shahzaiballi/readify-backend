@@ -1,6 +1,8 @@
 from rest_framework import serializers
 from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook
 from django.contrib.auth.models import AnonymousUser
+from apps.books.tasks import process_user_uploaded_book
+
 
 
 class BookListSerializer(serializers.ModelSerializer):
@@ -9,6 +11,7 @@ class BookListSerializer(serializers.ModelSerializer):
     Matches your BookEntity fields exactly.
     """
     readersCount = serializers.SerializerMethodField()
+    # Use get_cover_url() so both uploaded files and URL strings work
     imageUrl = serializers.SerializerMethodField()
     hasAudio = serializers.BooleanField(source='has_audio')
 
@@ -26,6 +29,7 @@ class BookListSerializer(serializers.ModelSerializer):
     def get_imageUrl(self, obj):
         request = self.context.get('request')
         url = obj.get_cover_url()
+        # If it's a relative path from an uploaded file, make it absolute
         if url and not url.startswith('http') and request:
             return request.build_absolute_uri(url)
         return url or ''
@@ -160,36 +164,52 @@ class FlashcardSerializer(serializers.ModelSerializer):
 
 
 # ── User Upload Serializers ───────────────────────────────────────────────────
-
-class UserUploadSerializer(serializers.Serializer):
-    """
-    ✅ SIMPLIFIED: This serializer only validates the incoming upload data.
-    The view (UserBookUploadView) handles creating the Book and
-    UserUploadedBook objects — keeping that logic in one place makes
-    debugging much easier.
-    """
-    title = serializers.CharField(max_length=255)
-    author = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+class UserUploadSerializer(serializers.ModelSerializer):
+    """✅ FIXED: Flutter PDF upload serializer - properly handles uploaded_by"""
     pdf_file = serializers.FileField()
 
+    class Meta:
+        model = UserUploadedBook
+        fields = ['title', 'author', 'pdf_file']
+    
     def validate_pdf_file(self, value):
-        """Validate PDF size and extension."""
+        """Validate PDF size/extension"""
         from django.conf import settings
-
+        
         if not value.name.lower().endswith('.pdf'):
-            raise serializers.ValidationError('Only PDF files are supported.')
-
+            raise serializers.ValidationError('Only PDF files supported')
+        
         max_size = getattr(settings, 'PDF_MAX_UPLOAD_SIZE_MB', 50) * 1024 * 1024
         if value.size > max_size:
-            raise serializers.ValidationError(
-                f'File is too large. Maximum size is {max_size // (1024 * 1024)} MB.'
-            )
-
+            raise serializers.ValidationError(f'Max size: {max_size//(1024*1024)}MB')
+        
         return value
+    
+    def create(self, validated_data):
+        request = self.context.get('request')
+        
+        if request and request.user and not isinstance(request.user, AnonymousUser):
+            validated_data['uploaded_by'] = request.user
+        else:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            system_user = User.objects.filter(is_superuser=True).first()
+            if system_user:
+                validated_data['uploaded_by'] = system_user
+            else:
+                raise serializers.ValidationError("No authenticated user available")
+
+        # ✅ Create upload
+        upload = UserUploadedBook.objects.create(**validated_data)
+
+        # 🚀 TRIGGER CELERY TASK (THIS WAS MISSING)
+        process_user_uploaded_book.delay(str(upload.id))
+
+        return upload
 
 
 class UserUploadStatusSerializer(serializers.ModelSerializer):
-    """Flutter polls this endpoint to check processing progress."""
+    """Flutter polls this for processing status"""
     bookId = serializers.SerializerMethodField()
     processingStatus = serializers.CharField(source='status')
 

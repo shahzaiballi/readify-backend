@@ -8,11 +8,10 @@ class LibraryBookSerializer(serializers.ModelSerializer):
     Matches your LibraryBookEntity exactly.
     Combines UserBook fields with Book fields.
     """
-    # All book fields flattened in (not nested)
     id = serializers.UUIDField(source='book.id')
     title = serializers.CharField(source='book.title')
     author = serializers.CharField(source='book.author')
-    imageUrl = serializers.SerializerMethodField()  # Use method field like BookListSerializer
+    imageUrl = serializers.SerializerMethodField()
     rating = serializers.DecimalField(
         source='book.rating',
         max_digits=3,
@@ -27,20 +26,21 @@ class LibraryBookSerializer(serializers.ModelSerializer):
     progressPercent = serializers.IntegerField(source='progress_percent')
     isFavorite = serializers.BooleanField(source='is_favorite')
 
+    # Expose the UserBook's own id so Flutter can PATCH /library/{userBookId}/
+    userBookId = serializers.UUIDField(source='id')
+
     class Meta:
         model = UserBook
         fields = [
-            'id', 'title', 'author', 'imageUrl',
+            'id', 'userBookId', 'title', 'author', 'imageUrl',
             'rating', 'readersCount', 'category',
             'hasAudio', 'badge',
             'progressPercent', 'isFavorite', 'status',
         ]
 
     def get_imageUrl(self, obj):
-        """Get the cover image URL, supporting both uploaded files and URL strings."""
         request = self.context.get('request')
         url = obj.book.get_cover_url()
-        # If it's a relative path from an uploaded file, make it absolute
         if url and not url.startswith('http') and request:
             return request.build_absolute_uri(url)
         return url or ''
@@ -64,7 +64,6 @@ class UpdateLibraryBookSerializer(serializers.ModelSerializer):
     """
     PATCH /library/{id}/
     Update progress, status, or favorite.
-    Matches actions from LibraryBookCard and CurrentlyReadingCard.
     """
     progressPercent = serializers.IntegerField(
         source='progress_percent',
@@ -81,24 +80,46 @@ class UpdateLibraryBookSerializer(serializers.ModelSerializer):
 
 class UserProgressSerializer(serializers.ModelSerializer):
     """
-    Matches your UserProgressEntity used on the home screen
-    in CurrentlyReadingCard.
+    Matches your UserProgressEntity used on the home screen.
+    Also returns currentChapterId so the app can resume reading at the
+    correct chapter without hard-coding any value.
     """
     bookId = serializers.UUIDField(source='book.id')
     title = serializers.CharField(source='book.title')
     author = serializers.CharField(source='book.author')
-    imageUrl = serializers.SerializerMethodField()  # Use method field to handle all cases
+    imageUrl = serializers.SerializerMethodField()
     progressPercent = serializers.IntegerField(source='progress_percent')
+
+    # The chapter the user was last reading — null if they haven't started yet
+    currentChapterId = serializers.SerializerMethodField()
+
+    # The chunk index within that chapter
+    currentChunkIndex = serializers.IntegerField(source='current_chunk_index')
 
     class Meta:
         model = UserBook
-        fields = ['bookId', 'title', 'author', 'imageUrl', 'progressPercent']
+        fields = [
+            'bookId', 'title', 'author', 'imageUrl',
+            'progressPercent', 'currentChapterId', 'currentChunkIndex',
+        ]
 
     def get_imageUrl(self, obj):
-        """Get the cover image URL, supporting both uploaded files and URL strings."""
         request = self.context.get('request')
         url = obj.book.get_cover_url()
-        # If it's a relative path from an uploaded file, make it absolute
         if url and not url.startswith('http') and request:
             return request.build_absolute_uri(url)
         return url or ''
+
+    def get_currentChapterId(self, obj):
+        """
+        Return the active chapter, falling back to the first chapter
+        if the user hasn't started yet.
+        """
+        if obj.current_chapter_id:
+            return str(obj.current_chapter_id)
+
+        # Fall back to the first chapter of the book
+        first_chapter = obj.book.chapters.order_by('chapter_number').first()
+        if first_chapter:
+            return str(first_chapter.id)
+        return None

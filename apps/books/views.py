@@ -108,14 +108,23 @@ class BookChaptersView(APIView):
 
 
 class ChapterChunksView(APIView):
-    """GET /books/chapters/{id}/chunks/"""
+    """
+    GET /books/{book_id}/chapters/{chapter_id}/chunks/
+
+    The book_id is accepted in the URL for RESTful consistency but the
+    chunk lookup only requires the chapter_id (chapters are globally unique).
+    """
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, chapter_id):
+    def get(self, request, book_id, chapter_id):
         try:
-            chapter = Chapter.objects.get(id=chapter_id)
+            # Validate that the chapter belongs to the given book
+            chapter = Chapter.objects.get(id=chapter_id, book_id=book_id)
         except Chapter.DoesNotExist:
-            return Response({'error': 'Chapter not found.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {'error': 'Chapter not found for this book.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         chunks = chapter.chunks.all()
         serializer = ChunkSerializer(chunks, many=True)
@@ -160,12 +169,6 @@ class BookFlashcardsView(APIView):
 class UserBookUploadView(APIView):
     """
     POST /books/upload/
-
-    ✅ FIXED: This view now creates a Book record FIRST, then links it to the
-    UserUploadedBook record, then queues the Celery task.
-
-    The old bug was: UserUploadedBook was created but upload.book was None,
-    so the Celery task logged "No book linked to upload" and exited immediately.
     """
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [IsAuthenticated]
@@ -183,9 +186,6 @@ class UserBookUploadView(APIView):
             logger.error(f"❌ Upload validation errors: {serializer.errors}")
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # ── Step 1: Create the placeholder Book record ──────────────────────
-        # This is what was MISSING before. The Celery task needs upload.book
-        # to exist so it knows where to save processed chapters/chunks.
         title = serializer.validated_data['title']
         author = serializer.validated_data.get('author', '')
 
@@ -195,28 +195,23 @@ class UserBookUploadView(APIView):
             category='User Upload',
             source=Book.Source.USER_UPLOAD,
             processing_status=Book.ProcessingStatus.PENDING,
-            is_published=True,   # Visible to the owning user
+            is_published=True,
             is_recommended=False,
             is_trending=False,
             description=f'Uploaded by {request.user.email}',
-            # Cover will be blank for now; AI task can set it later if needed
         )
         logger.info(f"📚 Created placeholder Book: {book.id} — '{book.title}'")
 
-        # ── Step 2: Create UserUploadedBook and link the Book ────────────────
         upload = UserUploadedBook.objects.create(
             uploaded_by=request.user,
             title=title,
             author=author,
             pdf_file=serializer.validated_data['pdf_file'],
-            book=book,                          # ✅ Link created here
+            book=book,
             status=UserUploadedBook.Status.PENDING,
         )
         logger.info(f"📄 Created UserUploadedBook: {upload.id}, book={book.id}")
 
-        # ── Step 3: Add the book to the user's library immediately ──────────
-        # This way it appears in the frontend library straight away (as
-        # "not_started") even before AI processing finishes.
         from apps.library.models import UserBook
         user_book, created = UserBook.objects.get_or_create(
             user=request.user,
@@ -228,7 +223,6 @@ class UserBookUploadView(APIView):
             f"user={request.user.email}, book={book.id}"
         )
 
-        # ── Step 4: Queue the Celery background task ─────────────────────────
         process_user_uploaded_book.delay(str(upload.id))
         logger.info(f"⚙️  Celery task queued for upload {upload.id}")
 

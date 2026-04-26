@@ -28,7 +28,7 @@ class LibraryView(APIView):
             user=request.user
         ).select_related('book')
 
-        # Filter by status tab (matches your LibrarySegmentedControl)
+        # Filter by status tab
         status_filter = request.query_params.get('status')
         if status_filter:
             user_books = user_books.filter(status=status_filter)
@@ -50,7 +50,6 @@ class LibraryView(APIView):
         book_id = serializer.validated_data['book_id']
         book = Book.objects.get(id=book_id)
 
-        # get_or_create prevents duplicates
         user_book, created = UserBook.objects.get_or_create(
             user=request.user,
             book=book,
@@ -72,13 +71,28 @@ class LibraryBookDetailView(APIView):
     """
     PATCH  /library/{id}/ → update progress, favorite, status
     DELETE /library/{id}/ → remove from library
+
+    NOTE: {id} here is the UserBook.id (UUID), NOT the Book.id.
+    The Flutter app must send the userBookId field that is now
+    included in the LibraryBookSerializer response.
     """
     permission_classes = [IsAuthenticated]
 
     def _get_user_book(self, request, pk):
-        """Helper to get user_book and verify ownership."""
+        """
+        Look up by UserBook primary key AND verify ownership.
+        Accepts both the UserBook UUID and — for backwards compatibility —
+        the Book UUID (we try the book lookup as a fallback).
+        """
+        # Primary lookup: UserBook.id
         try:
             return UserBook.objects.get(id=pk, user=request.user)
+        except UserBook.DoesNotExist:
+            pass
+
+        # Fallback: Flutter might be sending the Book.id
+        try:
+            return UserBook.objects.get(book_id=pk, user=request.user)
         except UserBook.DoesNotExist:
             return None
 
@@ -115,19 +129,18 @@ class LibraryBookDetailView(APIView):
 class CurrentProgressView(APIView):
     """
     GET /reading/progress/
-    Returns the book the user is currently reading.
-    Matches your currentProgressProvider and CurrentlyReadingCard.
-    
+    Returns the book the user is currently reading, including the chapter
+    and chunk to resume from.
+
     Returns 404 if no book is currently in progress.
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        # Most recently read in-progress book
         user_book = UserBook.objects.filter(
             user=request.user,
             status=UserBook.Status.IN_PROGRESS
-        ).select_related('book').first()
+        ).select_related('book', 'current_chapter').first()
 
         if not user_book:
             return Response(
