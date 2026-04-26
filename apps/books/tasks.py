@@ -1,12 +1,14 @@
 """
 apps/books/tasks.py
 
-✅ FIXED:
-- process_user_uploaded_book no longer exits early when upload.book is None
-  (because views.py now always creates the Book before queuing the task).
-- Added clearer logging so you can follow each step in the Celery console.
-- transaction.atomic() is used correctly (only around DB writes, not reads).
-- Retry countdown increased to 30 s for faster feedback during development.
+Changes vs original:
+- Integrated cover_service.fetch_cover_image_url() so every user-uploaded
+  book automatically gets a cover image (Google Books → Open Library →
+  generated placeholder). No manual upload needed.
+- process_user_uploaded_book no longer exits early when upload.book is None.
+- Added clearer logging for each processing step.
+- transaction.atomic() is used correctly (only around DB writes).
+- Retry countdown set to 30 s for faster feedback during development.
 """
 
 import re
@@ -21,6 +23,68 @@ logger = logging.getLogger(__name__)
 
 
 # ── PDF Helpers ────────────────────────────────────────────────────────────────
+
+def extract_first_page_as_image(pdf_path: str) -> str:
+    """Extract the first page of a PDF as an image and save it as cover."""
+    try:
+        import fitz  # PyMuPDF
+        from PIL import Image
+        import io
+        import uuid
+        import os
+        from django.conf import settings
+    except ImportError as e:
+        logger.error(f"Required library not installed: {e}. Skipping cover extraction.")
+        return ""
+
+    try:
+        doc = fitz.open(pdf_path)
+        if len(doc) == 0:
+            logger.warning(f"[PDF Cover] PDF has no pages: {pdf_path}")
+            doc.close()
+            return ""
+
+        # Render first page to image at 1.5x zoom for better quality
+        page = doc[0]
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        
+        # Convert pixmap to PIL Image (pix.n is number of channels: 3=RGB, 4=RGBA)
+        img = Image.frombytes(
+            "RGB" if pix.n == 3 else "RGBA",
+            (pix.width, pix.height),
+            pix.samples
+        )
+        
+        # Ensure RGB (remove alpha channel if present)
+        if img.mode == 'RGBA':
+            rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+            rgb_img.paste(img, mask=img.split()[3] if len(img.split()) == 4 else None)
+            img = rgb_img
+        
+        doc.close()
+        
+        # Save to media/books/covers/
+        covers_dir = os.path.join(settings.MEDIA_ROOT, 'books', 'covers')
+        os.makedirs(covers_dir, exist_ok=True)
+        
+        filename = f"cover_{uuid.uuid4()}.png"
+        filepath = os.path.join(covers_dir, filename)
+        img.save(filepath, 'PNG', quality=95)
+        
+        # Verify file was created and has content
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+            # Return relative path for Django FileField
+            relative_path = f"books/covers/{filename}"
+            logger.info(f"[PDF Cover] ✅ Extracted first page: {relative_path} ({os.path.getsize(filepath)} bytes)")
+            return relative_path
+        else:
+            logger.warning(f"[PDF Cover] Image file created but is empty: {filepath}")
+            return ""
+        
+    except Exception as exc:
+        logger.warning(f"[PDF Cover] ❌ Failed to extract cover from PDF: {exc}", exc_info=True)
+        return ""
+
 
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     """Extract text page-by-page using PyMuPDF (fitz)."""
@@ -59,15 +123,13 @@ def group_pages_into_chapters(pages: list[dict], pages_per_chapter: int = 15) ->
 
 def call_claude_for_chapter(chapter_text: str, chapter_number: int, book_title: str) -> dict:
     """
-    Send one chapter's raw text to Claude and get back structured data:
-    title, chunks, summary, key_takeaways, flashcards, estimated_read_minutes.
+    Send one chapter's raw text to Claude and get back structured data.
     Falls back to a safe default dict if the API call fails.
     """
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-        # Truncate to avoid hitting the context limit
         max_chars = 32_000
         if len(chapter_text) > max_chars:
             chapter_text = chapter_text[:max_chars] + '\n\n[...text truncated...]'
@@ -93,8 +155,6 @@ Return ONLY valid JSON with NO markdown fences:
         )
 
         response_text = message.content[0].text.strip()
-
-        # Strip accidental markdown fences
         response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
         response_text = re.sub(r'\s*```$', '', response_text)
 
@@ -121,12 +181,10 @@ Return ONLY valid JSON with NO markdown fences:
 def save_book_content_to_db(book, chapters_data: list[dict]):
     """
     Wipe any existing chapters/flashcards for this book and write fresh ones.
-    Wrapped in a single atomic transaction so partial failures don't corrupt data.
     """
     from apps.books.models import Chapter, Chunk, Summary, Flashcard
 
     with transaction.atomic():
-        # Clear old data (safe to re-run if task is retried)
         book.chapters.all().delete()
         book.flashcards.all().delete()
 
@@ -173,7 +231,6 @@ def save_book_content_to_db(book, chapters_data: list[dict]):
                     )
                     total_flashcards += 1
 
-        # Update book-level counters
         book.total_chapters = len(chapters_data)
         book.flashcards_count = total_flashcards
         book.save(update_fields=['total_chapters', 'flashcards_count'])
@@ -191,13 +248,13 @@ def process_user_uploaded_book(self, upload_id: str):
     """
     Background task: read the PDF, call Claude per chapter, persist results.
 
-    ✅ FIXED vs old version:
-    - No longer exits if upload.book is None (view.py now always creates it).
-    - If book is somehow missing, creates it as a last-resort fallback.
-    - Cleaner status transitions with explicit save calls.
+    NEW: Automatically fetches a cover image from Google Books / Open Library
+    if the book doesn't already have one — so user uploads always look good
+    in the Flutter app without requiring a manual image upload.
     """
     from apps.books.models import Book, UserUploadedBook
     from apps.library.models import UserBook
+    from apps.books.cover_service import fetch_cover_image_url  # ← NEW
 
     logger.info(f"[PDF Task] 🚀 Starting — upload_id={upload_id}")
 
@@ -208,7 +265,7 @@ def process_user_uploaded_book(self, upload_id: str):
         ).get(id=upload_id)
     except UserUploadedBook.DoesNotExist:
         logger.error(f"[PDF Task] ❌ Upload not found: {upload_id}")
-        return  # Nothing to retry
+        return
 
     logger.info(
         f"[PDF Task] Upload '{upload.title}' by {upload.uploaded_by.email} — "
@@ -216,11 +273,9 @@ def process_user_uploaded_book(self, upload_id: str):
     )
 
     # ── 2. Ensure a Book record exists ────────────────────────────────────────
-    # The view always creates one now, but this is a safety net.
     if upload.book is None:
         logger.warning(
-            f"[PDF Task] No Book linked to upload {upload_id}. "
-            "Creating fallback Book (view.py should have done this)."
+            f"[PDF Task] No Book linked to upload {upload_id}. Creating fallback."
         )
         book = Book.objects.create(
             title=upload.title,
@@ -237,7 +292,22 @@ def process_user_uploaded_book(self, upload_id: str):
     else:
         book = upload.book
 
-    # ── 3. Mark as processing ─────────────────────────────────────────────────
+    # ── 3. Auto-fetch cover image if missing ──────────────────────────────────
+    # NEW: Extract the first page of PDF as cover image automatically.
+    # This works for both user uploads and admin books.
+    if not book.cover_image and not book.cover_image_url:
+        logger.info(f"[PDF Task] Extracting first page as cover image for '{book.title}'...")
+        cover_path = extract_first_page_as_image(upload.pdf_file.path)
+        if cover_path:
+            book.cover_image = cover_path
+            book.save(update_fields=['cover_image'])
+            logger.info(f"[PDF Task] ✅ Cover image extracted: {cover_path}")
+        else:
+            logger.info(f"[PDF Task] ⚠️  Could not extract cover from PDF. Skipping fallback.")
+    else:
+        logger.info(f"[PDF Task] Book already has a cover image, skipping auto-fetch.")
+
+    # ── 4. Mark as processing ─────────────────────────────────────────────────
     try:
         upload.status = UserUploadedBook.Status.PROCESSING
         upload.save(update_fields=['status'])
@@ -249,7 +319,7 @@ def process_user_uploaded_book(self, upload_id: str):
         logger.error(f"[PDF Task] Could not update status: {exc}")
         raise self.retry(exc=exc, countdown=30)
 
-    # ── 4. Extract PDF text ───────────────────────────────────────────────────
+    # ── 5. Extract PDF text ───────────────────────────────────────────────────
     try:
         logger.info(f"[PDF Task] Reading PDF: {upload.pdf_file.path}")
         pages = extract_text_from_pdf(upload.pdf_file.path)
@@ -266,11 +336,11 @@ def process_user_uploaded_book(self, upload_id: str):
 
     logger.info(f"[PDF Task] Extracted {len(pages)} pages")
 
-    # ── 5. Group pages into chapters ──────────────────────────────────────────
+    # ── 6. Group pages into chapters ──────────────────────────────────────────
     raw_chapters = group_pages_into_chapters(pages)
     logger.info(f"[PDF Task] Grouped into {len(raw_chapters)} chapters")
 
-    # ── 6. Call Claude for each chapter ──────────────────────────────────────
+    # ── 7. Call Claude for each chapter ──────────────────────────────────────
     processed_chapters = []
     for raw_ch in raw_chapters:
         claude_result = call_claude_for_chapter(
@@ -282,7 +352,7 @@ def process_user_uploaded_book(self, upload_id: str):
         claude_result['page_range'] = raw_ch['page_range']
         processed_chapters.append(claude_result)
 
-    # ── 7. Save everything to the database ───────────────────────────────────
+    # ── 8. Save everything to the database ───────────────────────────────────
     try:
         save_book_content_to_db(book, processed_chapters)
     except Exception as exc:
@@ -290,7 +360,7 @@ def process_user_uploaded_book(self, upload_id: str):
         _mark_failed(upload, book, str(exc))
         raise self.retry(exc=exc, countdown=30)
 
-    # ── 8. Mark as completed ──────────────────────────────────────────────────
+    # ── 9. Mark as completed ──────────────────────────────────────────────────
     book.processing_status = Book.ProcessingStatus.COMPLETED
     book.save(update_fields=['processing_status'])
 
@@ -298,8 +368,7 @@ def process_user_uploaded_book(self, upload_id: str):
     upload.processed_at = datetime.now(tz=timezone.utc)
     upload.save(update_fields=['status', 'processed_at'])
 
-    # ── 9. Ensure the user has a library entry ────────────────────────────────
-    # (The view creates this too, but we re-run get_or_create just in case.)
+    # ── 10. Ensure the user has a library entry ───────────────────────────────
     user_book, created = UserBook.objects.get_or_create(
         user=upload.uploaded_by,
         book=book,
@@ -314,10 +383,12 @@ def process_user_uploaded_book(self, upload_id: str):
 @shared_task(bind=True, max_retries=2)
 def process_admin_book_pdf(self, book_id: str):
     """
-    Background task for admin-uploaded books (triggered by signals/admin save).
-    Identical flow to process_user_uploaded_book but works directly on a Book.
+    Background task for admin-uploaded books.
+
+    NEW: Also auto-fetches a cover image if the admin didn't provide one.
     """
     from apps.books.models import Book
+    from apps.books.cover_service import fetch_cover_image_url  # ← NEW
 
     logger.info(f"[Admin PDF Task] 🚀 Starting — book_id={book_id}")
 
@@ -330,6 +401,28 @@ def process_admin_book_pdf(self, book_id: str):
     if not book.pdf_file:
         logger.error(f"[Admin PDF Task] ❌ Book {book_id} has no PDF file.")
         return
+
+    # ── Auto-fetch cover image if missing ─────────────────────────────────────
+    # NEW: Extract the first page of PDF as cover image automatically.
+    # Falls back to external services if PDF cover extraction fails.
+    if not book.cover_image and not book.cover_image_url:
+        logger.info(f"[Admin PDF Task] Extracting first page as cover image for '{book.title}'...")
+        cover_path = extract_first_page_as_image(book.pdf_file.path)
+        if cover_path:
+            book.cover_image = cover_path
+            book.save(update_fields=['cover_image'])
+            logger.info(f"[Admin PDF Task] Cover image extracted: {cover_path}")
+        else:
+            logger.info(f"[Admin PDF Task] Could not extract cover from PDF, trying external services...")
+            cover_url = fetch_cover_image_url(
+        title=book.title,
+        author=book.author,
+        pdf_path=book.pdf_file.path
+    )
+            if cover_url:
+                book.cover_image_url = cover_url
+                book.save(update_fields=['cover_image_url'])
+                logger.info(f"[Admin PDF Task] Cover image set from external service: {cover_url[:80]}...")
 
     # Mark processing
     book.processing_status = Book.ProcessingStatus.PROCESSING

@@ -43,21 +43,19 @@ class RecommendedBooksView(APIView):
     """
     GET /books/recommended/
     Returns books marked is_recommended=True, EXCLUDING books the user
-    already has in their library (so they don't see "read again" in recommended).
-    Also excludes user-uploaded books (source='user_upload').
+    already has in their library.
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        # Get IDs of books already in user's library
         user_book_ids = request.user.user_books.values_list('book_id', flat=True)
 
         books = Book.objects.filter(
             is_published=True,
             is_recommended=True,
-            source=Book.Source.ADMIN,        # Only admin-curated books
+            source=Book.Source.ADMIN,
         ).exclude(
-            id__in=user_book_ids             # Exclude already-added books
+            id__in=user_book_ids
         )
 
         serializer = BookListSerializer(books, many=True, context={'request': request})
@@ -110,15 +108,11 @@ class BookChaptersView(APIView):
 class ChapterChunksView(APIView):
     """
     GET /books/{book_id}/chapters/{chapter_id}/chunks/
-
-    The book_id is accepted in the URL for RESTful consistency but the
-    chunk lookup only requires the chapter_id (chapters are globally unique).
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request, book_id, chapter_id):
         try:
-            # Validate that the chapter belongs to the given book
             chapter = Chapter.objects.get(id=chapter_id, book_id=book_id)
         except Chapter.DoesNotExist:
             return Response(
@@ -169,6 +163,14 @@ class BookFlashcardsView(APIView):
 class UserBookUploadView(APIView):
     """
     POST /books/upload/
+
+    Accepts PDF uploads from users and queues background AI processing.
+    
+    Changes vs original:
+    - Cover image is extracted from the first page of the PDF by the Celery task
+      (more reliable than external APIs). This ensures all user uploads get a
+      visual representation, even if external cover services are unavailable.
+    - Book is immediately visible in the library, but processing happens in background.
     """
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [IsAuthenticated]
@@ -189,6 +191,10 @@ class UserBookUploadView(APIView):
         title = serializer.validated_data['title']
         author = serializer.validated_data.get('author', '')
 
+        # ── Step 1: Create the Book placeholder (no cover yet) ─────────────────
+        # We skip external cover fetching here and let the Celery task handle it.
+        # This way, user uploads get the actual PDF first page as cover
+        # (which is more reliable than external APIs).
         book = Book.objects.create(
             title=title,
             author=author or 'Unknown Author',
@@ -199,9 +205,11 @@ class UserBookUploadView(APIView):
             is_recommended=False,
             is_trending=False,
             description=f'Uploaded by {request.user.email}',
+            # No cover set here — Celery task will extract from PDF
         )
         logger.info(f"📚 Created placeholder Book: {book.id} — '{book.title}'")
 
+        # ── Step 2: Create the UserUploadedBook record ────────────────────────
         upload = UserUploadedBook.objects.create(
             uploaded_by=request.user,
             title=title,
@@ -212,6 +220,7 @@ class UserBookUploadView(APIView):
         )
         logger.info(f"📄 Created UserUploadedBook: {upload.id}, book={book.id}")
 
+        # ── Step 3: Add book to user's library immediately ────────────────────
         from apps.library.models import UserBook
         user_book, created = UserBook.objects.get_or_create(
             user=request.user,
@@ -223,12 +232,13 @@ class UserBookUploadView(APIView):
             f"user={request.user.email}, book={book.id}"
         )
 
+        # ── Step 4: Queue background PDF processing ───────────────────────────
         process_user_uploaded_book.delay(str(upload.id))
         logger.info(f"⚙️  Celery task queued for upload {upload.id}")
 
         return Response(
             {
-                'message': '✅ Upload accepted — AI processing started.',
+                'message': '✅ Upload accepted — Cover will be extracted from PDF during processing.',
                 'id': str(upload.id),
                 'book_id': str(book.id),
             },

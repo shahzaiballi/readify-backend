@@ -87,8 +87,35 @@ class ReadingSessionView(APIView):
             user_book.progress_percent = round(
                 (completed_chapters / total_chapters) * 100
             )
-            user_book.current_chapter = chapter
-            user_book.current_chunk_index = data['chunk_index']
+            
+            # If the current chapter is completed, move to the next chapter
+            if chapter_progress.is_completed:
+                # Find the next unread chapter
+                next_chapter = Chapter.objects.filter(
+                    book=book,
+                    chapter_number__gt=chapter.chapter_number
+                ).order_by('chapter_number').first()
+                
+                if next_chapter:
+                    # Set next chapter as current
+                    user_book.current_chapter = next_chapter
+                    user_book.current_chunk_index = 0
+                    
+                    # Mark next chapter as active in chapter progress
+                    next_chapter_progress, _ = ChapterProgress.objects.get_or_create(
+                        user_book=user_book,
+                        chapter=next_chapter,
+                    )
+                    next_chapter_progress.is_active = True
+                    next_chapter_progress.save()
+                else:
+                    # No next chapter - user finished the book
+                    user_book.current_chapter = chapter
+                    user_book.current_chunk_index = data['chunk_index']
+            else:
+                # Current chapter not complete yet, keep it as current
+                user_book.current_chapter = chapter
+                user_book.current_chunk_index = data['chunk_index']
 
             # Mark whole book complete if all chapters done
             if user_book.progress_percent == 100:

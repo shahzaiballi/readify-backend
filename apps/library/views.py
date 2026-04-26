@@ -122,7 +122,17 @@ class LibraryBookDetailView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        user_book.delete()
+        # If this is a user-uploaded book, delete the Book record too
+        # (which will cascade-delete the UserBook via ForeignKey)
+        book = user_book.book
+        if book.source == Book.Source.USER_UPLOAD:
+            # Delete the book entirely (user upload)
+            # This automatically deletes user_book due to CASCADE
+            book.delete()
+        else:
+            # For admin books, just remove from user's library
+            user_book.delete()
+
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
