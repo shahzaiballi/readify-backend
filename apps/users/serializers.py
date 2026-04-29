@@ -15,17 +15,28 @@ from django.contrib.auth import authenticate
 from .models import User
 
 
+avatarUrl = serializers.SerializerMethodField()
+
 class UserSerializer(serializers.ModelSerializer):
-    """Response after login/register. Matches Flutter UserEntity."""
     name = serializers.CharField(source='full_name', read_only=True)
+    avatarUrl = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'name', 'email', 'avatar_url',
-                  'books_read', 'total_pages_read',
-                  'current_streak', 'is_avid_reader', 'created_at']
-        read_only_fields = ['id', 'created_at', 'books_read',
-                            'total_pages_read', 'current_streak']
+        fields = [
+            'id', 'name', 'email', 'avatarUrl',
+            'books_read', 'total_pages_read',
+            'current_streak', 'is_avid_reader', 'created_at'
+        ]
+
+    def get_avatarUrl(self, obj):
+        request = self.context.get('request')
+        if obj.avatar:
+            if request:
+                return request.build_absolute_uri(obj.avatar.url)
+            return obj.avatar.url
+
+        return f'https://i.pravatar.cc/150?u={obj.email}'
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -110,16 +121,14 @@ class AchievementSerializer(serializers.Serializer):
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    """
-    Full profile response — matches UserProfileEntity exactly.
-    Used by GET /api/v1/auth/profile/
-    """
     name = serializers.CharField(source='full_name', read_only=True)
     avatarUrl = serializers.SerializerMethodField()
+
     booksRead = serializers.IntegerField(source='books_read', read_only=True)
     totalPages = serializers.IntegerField(source='total_pages_read', read_only=True)
     currentStreak = serializers.IntegerField(source='current_streak', read_only=True)
     isAvidReader = serializers.BooleanField(source='is_avid_reader', read_only=True)
+
     achievements = serializers.SerializerMethodField()
 
     class Meta:
@@ -131,14 +140,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
         ]
 
     def get_avatarUrl(self, obj):
-        """Return avatar URL, building absolute URL if it's an uploaded file."""
         request = self.context.get('request')
-        if obj.avatar_url:
-            if obj.avatar_url.startswith('http'):
-                return obj.avatar_url
+        if obj.avatar:
             if request:
-                return request.build_absolute_uri(obj.avatar_url)
-        # Default fallback avatar
+                return request.build_absolute_uri(obj.avatar.url)
+            return obj.avatar.url
         return f'https://i.pravatar.cc/150?u={obj.email}'
 
     def get_achievements(self, user):
@@ -165,7 +171,6 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 'isUnlocked': user.total_pages_read >= 1000,
             },
         ]
-
 
 class ChangePasswordSerializer(serializers.Serializer):
     """POST /api/v1/auth/change-password/"""
@@ -218,4 +223,4 @@ class UpdateProfileSerializer(serializers.ModelSerializer):
     """For PATCH /api/v1/auth/me/ and PATCH /api/v1/auth/profile/"""
     class Meta:
         model = User
-        fields = ['full_name', 'avatar_url']
+        fields = ['full_name']

@@ -17,6 +17,7 @@ urlpatterns = [
 
     # Full profile with stats + achievements (this is what Flutter calls)
     path('profile/', views.UserProfileView.as_view(), name='profile'),
+    path('avatar/', views.AvatarUploadView.as_view()),
 
     # Password management
     path('change-password/', views.ChangePasswordView.as_view(), name='change-password'),

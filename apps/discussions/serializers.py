@@ -53,10 +53,14 @@ class ReplySerializer(serializers.ModelSerializer):
         return obj.user.full_name or obj.user.email.split('@')[0]
 
     def get_userAvatarUrl(self, obj):
-        if obj.user.avatar_url:
-            return obj.user.avatar_url
-        # Fallback to pravatar (matches your mock data pattern)
-        return f'https://i.pravatar.cc/150?u={obj.user.email}'
+     request = self.context.get('request')
+
+     if obj.user.avatar:
+        if request:
+            return request.build_absolute_uri(obj.user.avatar.url)
+        return obj.user.avatar.url
+
+     return f'https://i.pravatar.cc/150?u={obj.user.email}'
 
     def get_timeAgo(self, obj):
         return format_time_ago(obj.created_at)
@@ -99,9 +103,14 @@ class PostListSerializer(serializers.ModelSerializer):
         return obj.user.full_name or obj.user.email.split('@')[0]
 
     def get_userAvatarUrl(self, obj):
-        if obj.user.avatar_url:
-            return obj.user.avatar_url
-        return f'https://i.pravatar.cc/150?u={obj.user.email}'
+     request = self.context.get('request')
+
+     if obj.user.avatar:
+        if request:
+            return request.build_absolute_uri(obj.user.avatar.url)
+        return obj.user.avatar.url
+
+     return f'https://i.pravatar.cc/150?u={obj.user.email}'
 
     def get_timeAgo(self, obj):
         return format_time_ago(obj.created_at)
