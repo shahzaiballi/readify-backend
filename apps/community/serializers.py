@@ -3,12 +3,15 @@ apps/community/serializers.py
 """
 
 from rest_framework import serializers
-from .models import Community, CommunityMember, Message, MessageReaction
+from .models import Community, CommunityMember, Message
 from django.utils import timezone
+from django.db.models import Count
 
 
+# =========================
+# Member Serializer
+# =========================
 class MemberUserSerializer(serializers.Serializer):
-    """Lightweight user info shown in member list."""
     id = serializers.UUIDField()
     name = serializers.SerializerMethodField()
     avatarUrl = serializers.SerializerMethodField()
@@ -21,9 +24,7 @@ class MemberUserSerializer(serializers.Serializer):
     def get_avatarUrl(self, obj):
         request = self.context.get('request')
         if obj.user.avatar:
-            if request:
-                return request.build_absolute_uri(obj.user.avatar.url)
-            return obj.user.avatar.url
+            return request.build_absolute_uri(obj.user.avatar.url) if request else obj.user.avatar.url
         return f'https://i.pravatar.cc/150?u={obj.user.email}'
 
     def get_memberSince(self, obj):
@@ -34,29 +35,10 @@ class MemberUserSerializer(serializers.Serializer):
             status__in=['in_progress', 'not_started']
         ).count()
 
-    class Meta:
-        model = CommunityMember
-        fields = ['id', 'name', 'avatarUrl', 'memberSince', 'booksReading']
 
-
-class ReactionSummarySerializer(serializers.Serializer):
-    emoji = serializers.CharField()
-    count = serializers.IntegerField()
-    reactedByMe = serializers.BooleanField()
-
-
-class ReplyPreviewSerializer(serializers.Serializer):
-    id = serializers.UUIDField()
-    senderName = serializers.SerializerMethodField()
-    contentPreview = serializers.SerializerMethodField()
-
-    def get_senderName(self, obj):
-        return obj.sender.full_name or obj.sender.email.split('@')[0]
-
-    def get_contentPreview(self, obj):
-        return obj.content[:60] + '...' if len(obj.content) > 60 else obj.content
-
-
+# =========================
+# Message Serializer
+# =========================
 class MessageSerializer(serializers.ModelSerializer):
     senderId = serializers.UUIDField(source='sender.id')
     senderName = serializers.SerializerMethodField()
@@ -81,28 +63,30 @@ class MessageSerializer(serializers.ModelSerializer):
     def get_senderAvatarUrl(self, obj):
         request = self.context.get('request')
         if obj.sender.avatar:
-            if request:
-                return request.build_absolute_uri(obj.sender.avatar.url)
-            return obj.sender.avatar.url
+            return request.build_absolute_uri(obj.sender.avatar.url) if request else obj.sender.avatar.url
         return f'https://i.pravatar.cc/150?u={obj.sender.email}'
 
     def get_reactions(self, obj):
         request = self.context.get('request')
         user = request.user if request else None
+
         raw = obj.reactions.values('emoji').annotate(
-            count=serializers.IntegerField.__class__  # placeholder
+            count=Count('id')
         )
-        # Manual aggregation
-        emoji_map = {}
-        for r in obj.reactions.all():
-            if r.emoji not in emoji_map:
-                emoji_map[r.emoji] = {'count': 0, 'reactedByMe': False}
-            emoji_map[r.emoji]['count'] += 1
-            if user and r.user_id == user.id:
-                emoji_map[r.emoji]['reactedByMe'] = True
+
+        user_reactions = set()
+        if user and user.is_authenticated:
+            user_reactions = set(
+                obj.reactions.filter(user=user).values_list('emoji', flat=True)
+            )
+
         return [
-            {'emoji': e, 'count': v['count'], 'reactedByMe': v['reactedByMe']}
-            for e, v in emoji_map.items()
+            {
+                'emoji': r['emoji'],
+                'count': r['count'],
+                'reactedByMe': r['emoji'] in user_reactions
+            }
+            for r in raw
         ]
 
     def get_replyTo(self, obj):
@@ -123,9 +107,11 @@ class MessageSerializer(serializers.ModelSerializer):
     def get_timeLabel(self, obj):
         now = timezone.now()
         diff = now - obj.created_at
+
         minutes = int(diff.total_seconds() // 60)
         hours = minutes // 60
         days = hours // 24
+
         if minutes < 1:
             return 'now'
         if minutes < 60:
@@ -137,6 +123,9 @@ class MessageSerializer(serializers.ModelSerializer):
         return obj.created_at.strftime('%d %b')
 
 
+# =========================
+# Community List Serializer
+# =========================
 class CommunityListSerializer(serializers.ModelSerializer):
     isMember = serializers.SerializerMethodField()
     isAdmin = serializers.SerializerMethodField()
@@ -182,21 +171,25 @@ class CommunityListSerializer(serializers.ModelSerializer):
         msg = obj.messages.filter(is_deleted=False).last()
         if not msg:
             return None
+
+        serialized = MessageSerializer(msg, context=self.context).data
+
         return {
-            'senderName': msg.sender.full_name or msg.sender.email.split('@')[0],
-            'content': msg.content[:60],
-            'timeLabel': MessageSerializer(msg, context=self.context).get_timeLabel(msg),
+            'senderName': serialized['senderName'],
+            'content': serialized['content'][:60],
+            'timeLabel': serialized['timeLabel'],
         }
 
     def get_coverImageUrl(self, obj):
         request = self.context.get('request')
         if obj.cover_image:
-            if request:
-                return request.build_absolute_uri(obj.cover_image.url)
-            return obj.cover_image.url
+            return request.build_absolute_uri(obj.cover_image.url) if request else obj.cover_image.url
         return None
 
 
+# =========================
+# Community Detail Serializer
+# =========================
 class CommunityDetailSerializer(CommunityListSerializer):
     members = serializers.SerializerMethodField()
     inviteLink = serializers.SerializerMethodField()
@@ -212,12 +205,16 @@ class CommunityDetailSerializer(CommunityListSerializer):
         request = self.context.get('request')
         if not request:
             return None
+
         is_admin = obj.members.filter(user=request.user, role='admin').exists()
         if obj.privacy == 'private' and is_admin:
             return obj.invite_token
         return None
 
 
+# =========================
+# Create Community
+# =========================
 class CreateCommunitySerializer(serializers.Serializer):
     name = serializers.CharField(max_length=120)
     description = serializers.CharField(required=False, allow_blank=True, default='')
@@ -232,6 +229,9 @@ class CreateCommunitySerializer(serializers.Serializer):
         return data
 
 
+# =========================
+# Message Actions
+# =========================
 class SendMessageSerializer(serializers.Serializer):
     content = serializers.CharField(min_length=1, max_length=2000)
     reply_to_id = serializers.UUIDField(required=False, allow_null=True)
