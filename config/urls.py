@@ -9,13 +9,11 @@ urlpatterns = [
     path('api/v1/books/', include('apps.books.urls')),
     path('api/v1/library/', include('apps.library.urls')),
     path('api/v1/reading/', include('apps.reading.urls')),
-    path('api/v1/discussions/', include('apps.discussions.urls')),
+    path('api/v1/community/', include('apps.community.urls')),
+    # Discussions removed — replaced by Community
 ]
-
 
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
-# Serve uploaded media files in development
-# In production, nginx/S3 handles this instead
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

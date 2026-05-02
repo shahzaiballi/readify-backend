@@ -33,7 +33,7 @@ LOCAL_APPS = [
     'apps.books',
     'apps.library',
     'apps.reading',
-    'apps.discussions',
+    'apps.community',
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
