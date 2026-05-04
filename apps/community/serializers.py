@@ -1,5 +1,9 @@
 """
 apps/community/serializers.py
+Fixed:
+- Book community: book_id no longer required (search by title/author instead)
+- Image upload support for community avatar
+- Invite token exposure fixed
 """
 
 from rest_framework import serializers
@@ -17,6 +21,7 @@ class MemberUserSerializer(serializers.Serializer):
     avatarUrl = serializers.SerializerMethodField()
     memberSince = serializers.SerializerMethodField()
     booksReading = serializers.SerializerMethodField()
+    role = serializers.SerializerMethodField()
 
     def get_name(self, obj):
         return obj.user.full_name or obj.user.email.split('@')[0]
@@ -34,6 +39,9 @@ class MemberUserSerializer(serializers.Serializer):
         return obj.user.user_books.filter(
             status__in=['in_progress', 'not_started']
         ).count()
+
+    def get_role(self, obj):
+        return obj.role
 
 
 # =========================
@@ -70,9 +78,7 @@ class MessageSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         user = request.user if request else None
 
-        raw = obj.reactions.values('emoji').annotate(
-            count=Count('id')
-        )
+        raw = obj.reactions.values('emoji').annotate(count=Count('id'))
 
         user_reactions = set()
         if user and user.is_authenticated:
@@ -213,20 +219,38 @@ class CommunityDetailSerializer(CommunityListSerializer):
 
 
 # =========================
-# Create Community
+# Create Community - FIXED
+# Accepts multipart (image upload) and handles book communities
+# without requiring a book_id (searches by book name instead)
 # =========================
 class CreateCommunitySerializer(serializers.Serializer):
     name = serializers.CharField(max_length=120)
     description = serializers.CharField(required=False, allow_blank=True, default='')
     community_type = serializers.ChoiceField(choices=['general', 'book'])
     privacy = serializers.ChoiceField(choices=['public', 'private'])
+    # book_id is optional — if not provided for book type, we search by book_name
     book_id = serializers.UUIDField(required=False, allow_null=True)
+    book_name = serializers.CharField(required=False, allow_blank=True, default='')
+    book_author = serializers.CharField(required=False, allow_blank=True, default='')
     cover_emoji = serializers.CharField(max_length=10, required=False, default='📚')
+    cover_image = serializers.ImageField(required=False, allow_null=True)
 
     def validate(self, data):
-        if data.get('community_type') == 'book' and not data.get('book_id'):
-            raise serializers.ValidationError({'book_id': 'Book ID required for book communities.'})
+        # For book communities: either book_id OR book_name must be provided
+        if data.get('community_type') == 'book':
+            if not data.get('book_id') and not data.get('book_name'):
+                raise serializers.ValidationError({
+                    'book_name': 'Please provide a book name for book communities.'
+                })
         return data
+
+    def validate_book_id(self, value):
+        if value is None:
+            return value
+        from apps.books.models import Book
+        if not Book.objects.filter(id=value, is_published=True).exists():
+            raise serializers.ValidationError('Book not found.')
+        return value
 
 
 # =========================

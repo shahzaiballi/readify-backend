@@ -11,6 +11,8 @@ urlpatterns = [
     path('<uuid:community_id>/join/', views.JoinCommunityView.as_view(), name='join-community'),
     path('<uuid:community_id>/leave/', views.LeaveCommunityView.as_view(), name='leave-community'),
     path('<uuid:community_id>/members/', views.CommunityMembersView.as_view(), name='community-members'),
+    path('<uuid:community_id>/members/<uuid:user_id>/', views.KickMemberView.as_view(), name='kick-member'),
+    path('<uuid:community_id>/members/<uuid:user_id>/promote/', views.PromoteMemberView.as_view(), name='promote-member'),
 
     # Messages
     path('<uuid:community_id>/messages/', views.CommunityMessagesView.as_view(), name='community-messages'),

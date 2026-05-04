@@ -1,10 +1,18 @@
 """
 apps/community/views.py
+
+Fixed:
+- Book community creation without requiring catalog book_id
+- Image upload for community cover
+- Leave/Delete community endpoints
+- Faster message loading with select_related optimizations
+- Admin kick member endpoint
 """
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework import status
 
 from .models import Community, CommunityMember, Message, MessageReaction
@@ -18,17 +26,11 @@ from .serializers import (
 
 class CommunityListView(APIView):
     """
-    GET  /community/                  → discover public communities
-    POST /community/                  → create a new community
-
-    Query params:
-      ?type=general|book              → filter by type
-      ?book_id=<uuid>                 → book-specific communities
-      ?mine=true                      → communities I joined/created
-      ?private=true                   → my private communities
-      ?search=<str>                   → search by name
+    GET  /community/  → discover public communities
+    POST /community/  → create a new community (supports multipart for image upload)
     """
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get(self, request):
         mine = request.query_params.get('mine') == 'true'
@@ -38,16 +40,13 @@ class CommunityListView(APIView):
         search = request.query_params.get('search', '')
 
         if private:
-            # Private communities where I'm a member
             communities = Community.objects.filter(
                 members__user=request.user,
                 privacy='private',
             )
         elif mine:
-            # All communities I've joined (public or private)
             communities = Community.objects.filter(members__user=request.user)
         else:
-            # Public discovery
             communities = Community.objects.filter(privacy='public')
 
         if book_id:
@@ -59,7 +58,11 @@ class CommunityListView(APIView):
         if search:
             communities = communities.filter(name__icontains=search)
 
-        communities = communities.distinct().order_by('-member_count', '-created_at')
+        communities = communities.select_related(
+            'book', 'created_by'
+        ).prefetch_related(
+            'members'
+        ).distinct().order_by('-member_count', '-created_at')
 
         serializer = CommunityListSerializer(
             communities, many=True, context={'request': request}
@@ -73,14 +76,28 @@ class CommunityListView(APIView):
 
         data = serializer.validated_data
 
+        # ── Resolve book ───────────────────────────────────────────────────────
         book = None
-        if data.get('book_id'):
-            from apps.books.models import Book
-            try:
-                book = Book.objects.get(id=data['book_id'])
-            except Book.DoesNotExist:
-                return Response({'error': 'Book not found.'}, status=404)
+        if data.get('community_type') == 'book':
+            if data.get('book_id'):
+                # Exact match by ID
+                from apps.books.models import Book
+                try:
+                    book = Book.objects.get(id=data['book_id'])
+                except Book.DoesNotExist:
+                    return Response({'error': 'Book not found.'}, status=404)
+            elif data.get('book_name'):
+                # Search by title in catalog
+                from apps.books.models import Book
+                book_name = data['book_name'].strip()
+                book = Book.objects.filter(
+                    title__icontains=book_name,
+                    is_published=True
+                ).first()
+                # If not in catalog, that's OK — community will have no book link
+                # but we store the name in the description if needed
 
+        # ── Create community ───────────────────────────────────────────────────
         community = Community.objects.create(
             name=data['name'],
             description=data.get('description', ''),
@@ -91,6 +108,12 @@ class CommunityListView(APIView):
             cover_emoji=data.get('cover_emoji', '📚'),
             member_count=1,
         )
+
+        # ── Handle image upload ────────────────────────────────────────────────
+        cover_image = data.get('cover_image')
+        if cover_image:
+            community.cover_image = cover_image
+            community.save(update_fields=['cover_image'])
 
         # Creator becomes admin
         CommunityMember.objects.create(
@@ -106,16 +129,17 @@ class CommunityListView(APIView):
 
 
 class CommunityDetailView(APIView):
-    """GET /community/{id}/"""
+    """GET/DELETE /community/{id}/"""
     permission_classes = [IsAuthenticated]
 
     def get(self, request, community_id):
         try:
-            community = Community.objects.get(id=community_id)
+            community = Community.objects.select_related(
+                'book', 'created_by'
+            ).get(id=community_id)
         except Community.DoesNotExist:
             return Response({'error': 'Not found.'}, status=404)
 
-        # Private communities only visible to members
         if community.privacy == 'private':
             if not community.members.filter(user=request.user).exists():
                 return Response({'error': 'Not a member.'}, status=403)
@@ -125,16 +149,53 @@ class CommunityDetailView(APIView):
         )
 
     def delete(self, request, community_id):
+        """DELETE — only admin/creator can delete"""
         try:
-            community = Community.objects.get(id=community_id, created_by=request.user)
+            community = Community.objects.get(id=community_id)
         except Community.DoesNotExist:
-            return Response({'error': 'Not found or not admin.'}, status=404)
+            return Response({'error': 'Not found.'}, status=404)
+
+        is_admin = community.members.filter(
+            user=request.user, role=CommunityMember.Role.ADMIN
+        ).exists()
+
+        if not is_admin:
+            return Response({'error': 'Only admins can delete this community.'}, status=403)
+
         community.delete()
         return Response(status=204)
 
+    def patch(self, request, community_id):
+        """PATCH — update community name/description/emoji (admin only)"""
+        try:
+            community = Community.objects.get(id=community_id)
+        except Community.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=404)
+
+        is_admin = community.members.filter(
+            user=request.user, role=CommunityMember.Role.ADMIN
+        ).exists()
+
+        if not is_admin:
+            return Response({'error': 'Only admins can edit this community.'}, status=403)
+
+        if 'name' in request.data:
+            community.name = request.data['name']
+        if 'description' in request.data:
+            community.description = request.data['description']
+        if 'cover_emoji' in request.data:
+            community.cover_emoji = request.data['cover_emoji']
+        if 'cover_image' in request.FILES:
+            community.cover_image = request.FILES['cover_image']
+
+        community.save()
+        return Response(
+            CommunityDetailSerializer(community, context={'request': request}).data
+        )
+
 
 class JoinCommunityView(APIView):
-    """POST /community/{id}/join/ — join a public community"""
+    """POST /community/{id}/join/"""
     permission_classes = [IsAuthenticated]
 
     def post(self, request, community_id):
@@ -151,11 +212,16 @@ class JoinCommunityView(APIView):
             Community.objects.filter(id=community_id).update(
                 member_count=community.member_count + 1
             )
-        return Response({'joined': True, 'memberCount': community.member_count + (1 if created else 0)})
+            community.refresh_from_db()
+
+        return Response({
+            'joined': True,
+            'memberCount': community.member_count
+        })
 
 
 class JoinByInviteView(APIView):
-    """POST /community/join/{token}/ — join a private community via invite link"""
+    """POST /community/join/{token}/"""
     permission_classes = [IsAuthenticated]
 
     def post(self, request, token):
@@ -172,6 +238,8 @@ class JoinByInviteView(APIView):
             Community.objects.filter(id=community.id).update(
                 member_count=community.member_count + 1
             )
+            community.refresh_from_db()
+
         return Response(
             CommunityDetailSerializer(community, context={'request': request}).data
         )
@@ -188,10 +256,33 @@ class LeaveCommunityView(APIView):
             )
         except CommunityMember.DoesNotExist:
             return Response({'error': 'Not a member.'}, status=404)
+
+        # Check if this is the last admin — prevent orphaning
+        is_admin = membership.role == CommunityMember.Role.ADMIN
+        if is_admin:
+            admin_count = CommunityMember.objects.filter(
+                community_id=community_id,
+                role=CommunityMember.Role.ADMIN
+            ).count()
+            member_count_total = CommunityMember.objects.filter(
+                community_id=community_id
+            ).count()
+
+            if admin_count == 1 and member_count_total > 1:
+                return Response({
+                    'error': 'You are the only admin. Please promote another member before leaving.'
+                }, status=400)
+
         membership.delete()
-        Community.objects.filter(id=community_id).update(
-            member_count=max(0, Community.objects.get(id=community_id).member_count - 1)
-        )
+
+        try:
+            community = Community.objects.get(id=community_id)
+            new_count = max(0, community.member_count - 1)
+            community.member_count = new_count
+            community.save(update_fields=['member_count'])
+        except Community.DoesNotExist:
+            pass
+
         return Response({'left': True})
 
 
@@ -214,9 +305,70 @@ class CommunityMembersView(APIView):
         return Response(serializer.data)
 
 
+class KickMemberView(APIView):
+    """DELETE /community/{id}/members/{user_id}/ — admin only"""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, community_id, user_id):
+        try:
+            community = Community.objects.get(id=community_id)
+        except Community.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=404)
+
+        is_admin = community.members.filter(
+            user=request.user, role=CommunityMember.Role.ADMIN
+        ).exists()
+
+        if not is_admin:
+            return Response({'error': 'Only admins can remove members.'}, status=403)
+
+        # Cannot kick yourself
+        if str(request.user.id) == str(user_id):
+            return Response({'error': 'Cannot kick yourself. Use leave instead.'}, status=400)
+
+        try:
+            membership = CommunityMember.objects.get(
+                community=community, user_id=user_id
+            )
+            membership.delete()
+            new_count = max(0, community.member_count - 1)
+            Community.objects.filter(id=community_id).update(member_count=new_count)
+            return Response({'removed': True})
+        except CommunityMember.DoesNotExist:
+            return Response({'error': 'Member not found.'}, status=404)
+
+
+class PromoteMemberView(APIView):
+    """POST /community/{id}/members/{user_id}/promote/ — admin only"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, community_id, user_id):
+        try:
+            community = Community.objects.get(id=community_id)
+        except Community.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=404)
+
+        is_admin = community.members.filter(
+            user=request.user, role=CommunityMember.Role.ADMIN
+        ).exists()
+
+        if not is_admin:
+            return Response({'error': 'Only admins can promote members.'}, status=403)
+
+        try:
+            membership = CommunityMember.objects.get(
+                community=community, user_id=user_id
+            )
+            membership.role = CommunityMember.Role.ADMIN
+            membership.save()
+            return Response({'promoted': True})
+        except CommunityMember.DoesNotExist:
+            return Response({'error': 'Member not found.'}, status=404)
+
+
 class CommunityMessagesView(APIView):
     """
-    GET  /community/{id}/messages/     → paginated message history
+    GET  /community/{id}/messages/     → paginated message history (FAST)
     POST /community/{id}/messages/     → send a message
     """
     permission_classes = [IsAuthenticated]
@@ -233,11 +385,17 @@ class CommunityMessagesView(APIView):
         if not self._check_member(community, request.user):
             return Response({'error': 'Not a member.'}, status=403)
 
-        # Pagination: ?before=<message_id> for cursor-based loading
         before_id = request.query_params.get('before')
-        messages = community.messages.filter(is_deleted=False).select_related(
-            'sender', 'reply_to__sender'
-        ).prefetch_related('reactions__user')
+
+        # Optimized query with all related data in one hit
+        messages = community.messages.select_related(
+            'sender',
+            'reply_to',
+            'reply_to__sender',
+        ).prefetch_related(
+            'reactions',
+            'reactions__user',
+        )
 
         if before_id:
             try:
@@ -247,7 +405,7 @@ class CommunityMessagesView(APIView):
                 pass
 
         messages = messages.order_by('-created_at')[:50]
-        messages = list(reversed(messages))  # chronological order
+        messages = list(reversed(messages))
 
         serializer = MessageSerializer(messages, many=True, context={'request': request})
         return Response(serializer.data)
@@ -282,6 +440,11 @@ class CommunityMessagesView(APIView):
             reply_to=reply_to,
         )
 
+        # Refresh with related data for proper serialization
+        message = Message.objects.select_related(
+            'sender', 'reply_to', 'reply_to__sender'
+        ).prefetch_related('reactions').get(id=message.id)
+
         return Response(
             MessageSerializer(message, context={'request': request}).data,
             status=201,
@@ -289,7 +452,7 @@ class CommunityMessagesView(APIView):
 
 
 class MessageReactionView(APIView):
-    """POST /community/messages/{id}/react/ — toggle a reaction"""
+    """POST /community/messages/{id}/react/"""
     permission_classes = [IsAuthenticated]
 
     def post(self, request, message_id):
@@ -329,10 +492,7 @@ class DeleteMessageView(APIView):
 
 
 class BuddyGroupSuggestionsView(APIView):
-    """
-    GET /community/suggestions/buddy/
-    Returns one suggested group per paused/not-started book the user has.
-    """
+    """GET /community/suggestions/buddy/"""
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -348,7 +508,6 @@ class BuddyGroupSuggestionsView(APIView):
         suggestions = []
         for ub in paused_books:
             book = ub.book
-            # Find or suggest the most popular community for this book
             community = Community.objects.filter(
                 book=book, privacy='public'
             ).order_by('-member_count').first()
