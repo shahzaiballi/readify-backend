@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+# pyrefly: ignore [missing-import]
 from decouple import config
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -34,6 +35,7 @@ LOCAL_APPS = [
     'apps.library',
     'apps.reading',
     'apps.community',
+    'apps.book_intelligence',  # Book Intelligence Agent (isolated)
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -48,8 +50,7 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
-MEDIA_URL = '/media/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+# (MEDIA defined once below — duplicate removed)
 
 ROOT_URLCONF = 'config.urls'
 
@@ -149,8 +150,16 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 
-# ── Anthropic (Claude) API ────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = config('ANTHROPIC_API_KEY', default='')
+# ── DeepSeek API (primary AI — replaces Claude) ──────────────────────────────
+# Get your key at https://platform.deepseek.com
+# Model used: deepseek-chat (DeepSeek V3)
+DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
+
+# ── Google Gemini API (free embeddings for RAG) ───────────────────────────────
+# Free tier: https://aistudio.google.com/app/apikey
+# Used ONLY for text-embedding-004 (zero cost at our scale)
+# Falls back to keyword matching if key not set
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 
 # ── PDF Upload Settings ───────────────────────────────────────────────────────
 # Max PDF size: 50MB (matches your Flutter AddBookPage UI text)

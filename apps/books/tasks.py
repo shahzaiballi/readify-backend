@@ -186,81 +186,7 @@ def group_pages_into_chapters(pages: list[dict], pages_per_chapter: int = 17) ->
     return chapters
 
 
-# ── Claude Integration (title/summary/flashcards only) ────────────────────────
-
-def call_claude_for_metadata(chapter_text: str, chapter_number: int, book_title: str) -> dict:
-    """
-    Ask Claude ONLY for metadata: title, summary, key takeaways, flashcards.
-
-    IMPORTANT: We do NOT ask Claude to split the text into chunks anymore.
-    Chunk splitting is handled deterministically by split_text_into_chunks()
-    above, which guarantees the right number of pages every time.
-
-    Claude's job here is purely semantic: understand the chapter and generate
-    the study aids. This is a much simpler, more reliable task.
-    """
-    try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-
-        # Limit input to avoid token limits — use first 8000 chars for metadata
-        preview_text = chapter_text[:8000]
-        if len(chapter_text) > 8000:
-            preview_text += '\n\n[...chapter continues...]'
-
-        prompt = f"""You are processing Chapter {chapter_number} of "{book_title}".
-
-<chapter_text>
-{preview_text}
-</chapter_text>
-
-Return ONLY valid JSON with NO markdown fences, NO extra text:
-{{
-  "title": "Descriptive chapter title (max 60 chars)",
-  "summary": "2-3 sentence summary of the main ideas in this chapter",
-  "key_takeaways": [
-    "Key insight 1 (1 sentence)",
-    "Key insight 2 (1 sentence)",
-    "Key insight 3 (1 sentence)"
-  ],
-  "flashcards": [
-    {{"question": "A question testing understanding of this chapter", "answer": "A clear concise answer"}},
-    {{"question": "Another question", "answer": "Another answer"}},
-    {{"question": "Third question", "answer": "Third answer"}}
-  ],
-  "estimated_read_minutes": {max(5, (len(chapter_text.split()) // 200))}
-}}"""
-
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        response_text = message.content[0].text.strip()
-        # Strip any accidental markdown fences
-        response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
-        response_text = re.sub(r'\s*```$', '', response_text)
-
-        result = json.loads(response_text)
-        logger.info(
-            f"[Claude] Ch.{chapter_number} metadata: "
-            f"title='{result.get('title', '')[:40]}', "
-            f"{len(result.get('flashcards', []))} flashcards"
-        )
-        return result
-
-    except Exception as exc:
-        logger.warning(f"[Claude] Ch.{chapter_number} metadata failed ({exc}), using fallback.")
-        # Safe fallback — processing continues without AI metadata
-        word_count = len(chapter_text.split())
-        return {
-            "title": f"Chapter {chapter_number}",
-            "summary": f"Chapter {chapter_number} content.",
-            "key_takeaways": [],
-            "flashcards": [],
-            "estimated_read_minutes": max(5, word_count // 200),
-        }
+# ── DeepSeek Integration for AI Metadata moved to lazy generation endpoint ──
 
 
 def process_chapter(raw_chapter: dict, book_title: str) -> dict:
@@ -278,8 +204,8 @@ def process_chapter(raw_chapter: dict, book_title: str) -> dict:
     chapter_number = raw_chapter['chapter_number']
     page_count = raw_chapter.get('page_count', 17)
 
-    # Step 1: Get Claude metadata (title, summary, flashcards)
-    metadata = call_claude_for_metadata(chapter_text, chapter_number, book_title)
+    # Note: AI metadata (summary, flashcards) is now generated LAZILY on demand
+    # when the user starts reading the chapter, not during upload.
 
     # Step 2: Deterministic chunk splitting
     # Target: ~3 chunks per page (each chunk ~2 min at 250 words)
@@ -302,12 +228,12 @@ def process_chapter(raw_chapter: dict, book_title: str) -> dict:
     return {
         'chapter_number': chapter_number,
         'page_range': raw_chapter.get('page_range', ''),
-        'title': metadata.get('title', f'Chapter {chapter_number}'),
-        'summary': metadata.get('summary', ''),
-        'key_takeaways': metadata.get('key_takeaways', []),
-        'flashcards': metadata.get('flashcards', []),
-        'estimated_read_minutes': metadata.get('estimated_read_minutes', len(chunks) * 2),
-        # CHUNKS come from our deterministic splitter, NOT from Claude
+        'title': f'Chapter {chapter_number}',
+        'summary': '',
+        'key_takeaways': [],
+        'flashcards': [],
+        'estimated_read_minutes': len(chunks) * 2,
+        # CHUNKS come from our deterministic splitter
         'chunks': chunks,
     }
 
@@ -597,3 +523,142 @@ def _mark_failed(upload, book, error_message: str):
         book.save(update_fields=['processing_status', 'processing_error'])
     except Exception as e:
         logger.error(f"[_mark_failed] Could not update book: {e}")
+
+# ── Lazy AI Generation Tasks ───────────────────────────────────────────────────
+
+@shared_task(bind=True, max_retries=2)
+def generate_book_brief_task(self, book_id: str):
+    """
+    Generates a 1-paragraph book brief and saves it to the Book's description.
+    Uses DeepSeek V3.
+    """
+    from apps.books.models import Book
+    try:
+        book = Book.objects.get(id=book_id)
+        if book.description and not book.description.startswith('Uploaded by'):
+            return # Already generated
+
+        from openai import OpenAI
+        api_key = getattr(settings, 'DEEPSEEK_API_KEY', '')
+        if not api_key: return
+
+        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
+        
+        # Get sample text from first chapter
+        first_chapter = book.chapters.order_by('chapter_number').first()
+        sample_text = ""
+        if first_chapter:
+            chunks = first_chapter.chunks.all()[:10]
+            sample_text = " ".join(c.text for c in chunks)[:4000]
+
+        prompt = f"""You are a book expert. Write a single, concise paragraph (max 4 sentences) summarizing the book "{book.title}" by {book.author}. 
+Here is a sample of the text to understand the context:
+{sample_text}
+
+Return only the paragraph text, no markdown, no quotes."""
+
+        response = client.chat.completions.create(
+            model='deepseek-chat',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=256,
+            temperature=0.3,
+        )
+
+        brief = response.choices[0].message.content.strip()
+        book.description = brief
+        book.save(update_fields=['description'])
+        logger.info(f"[Lazy AI] Generated book brief for '{book.title}'")
+
+    except Exception as exc:
+        logger.error(f"[Lazy AI] Book brief generation failed: {exc}")
+
+
+@shared_task(bind=True, max_retries=2)
+def generate_chapter_metadata_task(self, chapter_id: str):
+    """
+    Generates chapter summary, flashcards, and title lazily.
+    """
+    from apps.books.models import Chapter, Summary, Flashcard
+    try:
+        chapter = Chapter.objects.select_related('book').get(id=chapter_id)
+        
+        # Check if already generated
+        if hasattr(chapter, 'summary'):
+            return
+
+        from openai import OpenAI
+        api_key = getattr(settings, 'DEEPSEEK_API_KEY', '')
+        if not api_key: return
+
+        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
+        
+        chunks = chapter.chunks.order_by('chunk_index')
+        chapter_text = " ".join(c.text for c in chunks)
+        preview_text = chapter_text[:8000]
+        if len(chapter_text) > 8000:
+            preview_text += '\n\n[...chapter continues...]'
+
+        prompt = f"""You are processing Chapter {chapter.chapter_number} of "{chapter.book.title}".
+
+<chapter_text>
+{preview_text}
+</chapter_text>
+
+Return ONLY valid JSON with NO markdown fences, NO extra text:
+{{
+  "title": "Descriptive chapter title (max 60 chars)",
+  "summary": "2-3 sentence summary of the main ideas in this chapter",
+  "key_takeaways": [
+    "Key insight 1 (1 sentence)",
+    "Key insight 2 (1 sentence)",
+    "Key insight 3 (1 sentence)"
+  ],
+  "flashcards": [
+    {{"question": "A question testing understanding of this chapter", "answer": "A clear concise answer"}},
+    {{"question": "Another question", "answer": "Another answer"}},
+    {{"question": "Third question", "answer": "Third answer"}}
+  ]
+}}"""
+
+        response = client.chat.completions.create(
+            model='deepseek-chat',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=1024,
+            temperature=0.2,
+        )
+
+        response_text = response.choices[0].message.content.strip()
+        response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
+        response_text = re.sub(r'\s*```$', '', response_text)
+
+        result = json.loads(response_text)
+        
+        with transaction.atomic():
+            if result.get('title') and result['title'] != f'Chapter {chapter.chapter_number}':
+                chapter.title = result['title'][:255]
+                chapter.save(update_fields=['title'])
+                
+            Summary.objects.create(
+                chapter=chapter,
+                title=chapter.title,
+                summary_content=result.get('summary', ''),
+                key_takeaways=result.get('key_takeaways', []),
+                is_locked=False,
+            )
+            
+            new_flashcards = []
+            for fc in result.get('flashcards', []):
+                q = (fc.get('question') or '').strip()
+                a = (fc.get('answer') or '').strip()
+                if q and a:
+                    new_flashcards.append(Flashcard(book=chapter.book, question=q, answer=a))
+            
+            if new_flashcards:
+                Flashcard.objects.bulk_create(new_flashcards)
+                chapter.book.flashcards_count += len(new_flashcards)
+                chapter.book.save(update_fields=['flashcards_count'])
+
+        logger.info(f"[Lazy AI] Generated metadata for Chapter {chapter.chapter_number} of '{chapter.book.title}'")
+
+    except Exception as exc:
+        logger.error(f"[Lazy AI] Chapter metadata generation failed: {exc}")

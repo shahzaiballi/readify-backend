@@ -111,6 +111,20 @@ class LibraryBookDetailView(APIView):
         )
         if serializer.is_valid():
             serializer.save()
+            
+            # Smart Priority Queue: if marked 'in_progress', queue chapter summaries
+            if request.data.get('status') == 'in_progress':
+                try:
+                    from apps.books.tasks import generate_chapter_metadata_task
+                    from apps.books.models import Chapter
+                    first_chapter = Chapter.objects.filter(book=user_book.book).order_by('chapter_number').first()
+                    if first_chapter and not hasattr(first_chapter, 'summary'):
+                        generate_chapter_metadata_task.delay(str(first_chapter.id))
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.error(f"Failed to queue priority generation: {e}")
+                    
             return Response(LibraryBookSerializer(user_book, context={'request': request}).data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 

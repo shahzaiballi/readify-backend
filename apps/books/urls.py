@@ -26,4 +26,9 @@ urlpatterns = [
         views.ChapterChunksView.as_view(),
         name='chapter-chunks',
     ),
+    path(
+        '<uuid:book_id>/chapters/<uuid:chapter_id>/chunks/<int:chunk_id>/summary/',
+        views.ChunkSummaryView.as_view(),
+        name='chunk-summary',
+    ),
 ]

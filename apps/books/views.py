@@ -14,7 +14,11 @@ from .serializers import (
     SummarySerializer, FlashcardSerializer,
     UserUploadSerializer, UserUploadStatusSerializer,
 )
-from .tasks import process_user_uploaded_book
+from .tasks import (
+    process_user_uploaded_book, 
+    generate_book_brief_task, 
+    generate_chapter_metadata_task
+)
 
 
 class BookListView(APIView):
@@ -86,6 +90,13 @@ class BookDetailView(APIView):
         except Book.DoesNotExist:
             return Response({'error': 'Book not found.'}, status=status.HTTP_404_NOT_FOUND)
 
+        # Lazy AI: Generate Book Brief if missing
+        if not book.description or book.description.startswith('Uploaded by'):
+            try:
+                generate_book_brief_task.delay(str(book.id))
+            except Exception as e:
+                logger.error(f"Failed to queue book brief generation: {e}")
+
         serializer = BookDetailSerializer(book, context={'request': request})
         return Response(serializer.data)
 
@@ -119,6 +130,20 @@ class ChapterChunksView(APIView):
                 {'error': 'Chapter not found for this book.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # Lazy AI: Generate metadata for this chapter and the next one (progressive generation)
+        try:
+            if not hasattr(chapter, 'summary'):
+                generate_chapter_metadata_task.delay(str(chapter.id))
+            
+            next_chapter = Chapter.objects.filter(
+                book_id=book_id, 
+                chapter_number=chapter.chapter_number + 1
+            ).first()
+            if next_chapter and not hasattr(next_chapter, 'summary'):
+                generate_chapter_metadata_task.delay(str(next_chapter.id))
+        except Exception as e:
+            logger.error(f"Failed to queue progressive generation: {e}")
 
         chunks = chapter.chunks.all()
         serializer = ChunkSerializer(chunks, many=True)
@@ -156,6 +181,48 @@ class BookFlashcardsView(APIView):
         flashcards = book.flashcards.all()
         serializer = FlashcardSerializer(flashcards, many=True)
         return Response(serializer.data)
+
+
+class ChunkSummaryView(APIView):
+    """
+    GET /books/{id}/chapters/{chapter_id}/chunks/{chunk_id}/summary/
+    On-demand page summary. Does a synchronous AI call and returns the summary text.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, book_id, chapter_id, chunk_id):
+        try:
+            chunk = Chunk.objects.get(id=chunk_id, chapter_id=chapter_id, chapter__book_id=book_id)
+        except Chunk.DoesNotExist:
+            return Response({'error': 'Page not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from openai import OpenAI
+        from django.conf import settings
+
+        api_key = getattr(settings, 'DEEPSEEK_API_KEY', '')
+        if not api_key:
+            return Response({'error': 'AI not configured.'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+
+        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
+        
+        prompt = f"""Summarize the following book page in 2-3 concise sentences. Focus on the core idea:
+
+{chunk.text}
+
+Return only the summary text, no markdown."""
+
+        try:
+            response = client.chat.completions.create(
+                model='deepseek-chat',
+                messages=[{'role': 'user', 'content': prompt}],
+                max_tokens=150,
+                temperature=0.2,
+            )
+            summary = response.choices[0].message.content.strip()
+            return Response({'summary': summary})
+        except Exception as exc:
+            logger.error(f"[Page Summary] Failed: {exc}")
+            return Response({'error': 'Failed to generate summary.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ── User Upload Views ─────────────────────────────────────────────────────────
