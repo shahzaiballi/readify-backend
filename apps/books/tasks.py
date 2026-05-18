@@ -186,6 +186,61 @@ def group_pages_into_chapters(pages: list[dict], pages_per_chapter: int = 17) ->
     return chapters
 
 
+def group_pages_with_ai(pages: list[dict], book_title: str) -> tuple[list[dict], bool]:
+    """
+    Attempts to group pages based on the actual Table of Contents using AI.
+    Returns: (chapters_list, is_success)
+    """
+    if not pages:
+        return [], False
+
+    from apps.book_intelligence.ai_client import detect_chapter_structure
+    
+    total_pages = len(pages)
+    # Extract first 40 pages to find the TOC
+    toc_pages = pages[:40]
+    toc_text = "\n\n".join([f"--- Page {p['page_number']} ---\n{p['text']}" for p in toc_pages])
+
+    try:
+        structure = detect_chapter_structure(book_title, toc_text, total_pages)
+        if not structure:
+            return [], False
+
+        chapters = []
+        for ch in structure:
+            start_page = ch.get('start_page', 1)
+            end_page = ch.get('end_page', total_pages)
+            
+            # Bound pages
+            start_page = max(1, start_page)
+            end_page = min(total_pages, end_page)
+
+            # Get the pages for this chapter
+            chapter_pages = [p for p in pages if start_page <= p['page_number'] <= end_page]
+            if not chapter_pages:
+                continue
+
+            full_text = '\n\n'.join(p['text'] for p in chapter_pages)
+            
+            chapters.append({
+                'chapter_number': ch.get('chapter_number', len(chapters) + 1),
+                'title': ch.get('title', f"Chapter {len(chapters) + 1}"),
+                'pages': [p['page_number'] for p in chapter_pages],
+                'page_range': f"Pages {start_page}–{end_page}",
+                'text': full_text,
+                'page_count': len(chapter_pages),
+            })
+
+        if not chapters:
+            return [], False
+
+        logger.info(f"[PDF AI] Successfully grouped {total_pages} pages into {len(chapters)} actual chapters!")
+        return chapters, True
+    except Exception as e:
+        logger.warning(f"[PDF AI] Failed to group pages with AI: {e}")
+        return [], False
+
+
 # ── DeepSeek Integration for AI Metadata moved to lazy generation endpoint ──
 
 
@@ -220,7 +275,7 @@ def process_chapter(raw_chapter: dict, book_title: str) -> dict:
         chunks = [chapter_text.strip()]
 
     logger.info(
-        f"[Process] Ch.{chapter_number} '{metadata.get('title', '')}': "
+        f"[Process] Ch.{chapter_number} : "
         f"{len(chapter_text.split())} words → {len(chunks)} chunks "
         f"({page_count} PDF pages)"
     )
@@ -382,7 +437,13 @@ def process_user_uploaded_book(self, upload_id: str):
     logger.info(f"[PDF Task] Extracted {len(pages)} pages")
 
     # ── 6. Group pages into chapters ───────────────────────────────────────────
-    raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
+    raw_chapters, is_ai_success = group_pages_with_ai(pages, upload.title)
+    
+    if not is_ai_success:
+        logger.warning(f"[PDF Task] AI chapter grouping failed. Falling back to manual 17-page split.")
+        raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
+        book.description = "[Note: Chapters were manually split because the AI could not detect the Table of Contents]\n\n" + book.description
+        book.save(update_fields=['description'])
 
     # ── 7. Process each chapter (Claude metadata + deterministic chunks) ────────
     processed_chapters = []
@@ -478,7 +539,12 @@ def process_admin_book_pdf(self, book_id: str):
         return
 
     # Group and process chapters
-    raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
+    raw_chapters, is_ai_success = group_pages_with_ai(pages, book.title)
+    if not is_ai_success:
+        logger.warning(f"[Admin PDF Task] AI chapter grouping failed. Falling back to manual 17-page split.")
+        raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
+        book.description = "[Note: Chapters were manually split because the AI could not detect the Table of Contents]\n\n" + book.description
+        book.save(update_fields=['description'])
     processed_chapters = []
 
     for raw_ch in raw_chapters:

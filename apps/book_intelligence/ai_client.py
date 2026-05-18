@@ -93,55 +93,47 @@ Return ONLY valid JSON, no markdown:
         }
 
 
-def detect_chapter_structure(book_title: str, full_text: str, existing_chapters: list[dict]) -> list[dict]:
+def detect_chapter_structure(book_title: str, toc_text: str, total_pages: int) -> list[dict]:
     """
-    Detect semantic chapter structure from book text.
-    existing_chapters: list of {chapter_number, title, page_range} from apps.books
-
-    Returns: list of {chapter_number, title, start_page, end_page, hook}
+    Extract actual chapters and their starting pages from the Table of Contents.
+    Returns: list of {chapter_number, title, start_page, end_page}
     """
-    chapters_context = json.dumps(existing_chapters[:20], indent=2)
+    prompt = f"""You are analyzing the first few pages of "{book_title}" to find its Table of Contents.
+Total pages in PDF: {total_pages}
 
-    prompt = f"""You are analyzing the structure of "{book_title}".
+Text sample (first 40 pages):
+{toc_text[:12000]}
 
-Existing chapter divisions (from PDF processing):
-{chapters_context}
+Your task: Find the Table of Contents and extract the actual chapters and their starting page numbers.
+- Ignore front matter (title page, copyright, dedication) unless it has a clear page number.
+- Ensure start_page is an integer.
+- The end_page of chapter N is (start_page of chapter N+1) - 1.
+- The end_page of the last chapter is {total_pages}.
+- If you CANNOT find a clear Table of Contents with page numbers, return an empty array [].
 
-Your task: Review these chapters and create a clean, semantic structure.
-- Keep the same page ranges but improve chapter titles to be meaningful and descriptive
-- Add a one-sentence "hook" for each chapter (what the reader will learn)
-- If chapters seem too granular, you may suggest combining them
-
-Return ONLY valid JSON array, no markdown:
+Return ONLY a valid JSON array, no markdown:
 [
   {{
     "chapter_number": 1,
-    "title": "Descriptive title (max 60 chars)",
-    "start_page": 1,
-    "end_page": 17,
-    "hook": "One sentence describing the core idea of this chapter"
+    "title": "Actual Chapter Title",
+    "start_page": 15,
+    "end_page": 32
   }}
 ]"""
 
     try:
-        raw = call_deepseek(prompt, max_tokens=2048, temperature=0.2)
+        raw = call_deepseek(prompt, max_tokens=2048, temperature=0.1)
         result = _parse_json_response(raw)
-        if isinstance(result, list):
+        if isinstance(result, list) and len(result) > 0:
+            # Validate format
+            for ch in result:
+                if 'start_page' not in ch or 'end_page' not in ch:
+                    return []
             return result
-        return existing_chapters
+        return []
     except Exception as e:
         logger.warning(f'[DeepSeek] detect_chapter_structure failed: {e}')
-        # Fall back to existing structure with generic hooks
-        return [
-            {
-                'chapter_number': ch.get('chapter_number', i + 1),
-                'title': ch.get('title', f"Chapter {i + 1}"),
-                'start_page': 1,
-                'end_page': 17,
-                'hook': f"Key ideas from chapter {i + 1}",
-            }
-            for i, ch in enumerate(existing_chapters)
-        ]
+        return []
 
 
 def generate_book_brief(book_title: str, book_author: str, chapter_summaries: list[str]) -> dict:
