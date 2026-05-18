@@ -15,10 +15,11 @@ openai>=1.30.0
 # AI — Google Gemini (FREE tier, used only for text embeddings in RAG)
 google-generativeai>=0.7.0
 
-# Background tasks (Celery)
+# Background tasks (Celery + Beat scheduler)
 celery==5.4.0
 redis==5.0.7
 django-celery-results==2.5.1
+django-celery-beat==2.6.0
 
 # File uploads
 Pillow==10.4.0

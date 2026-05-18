@@ -156,25 +156,21 @@ class BookAdmin(admin.ModelAdmin):
         Override save to trigger PDF processing after upload.
 
         This is called when admin clicks "Save" on the book form.
-        If a new PDF was uploaded, we start the background task.
+        If a new PDF was uploaded, we reset status to PENDING so the
+        post_save signal fires exactly once and dispatches the Celery task.
         """
         # Check if a new PDF was uploaded in this save
         pdf_changed = 'pdf_file' in form.changed_data and obj.pdf_file
 
-        super().save_model(request, obj, form, change)
-
         if pdf_changed:
-            # Import here to avoid circular imports
-            from .tasks import process_admin_book_pdf
-
-            # Reset processing status before starting
+            # Set PENDING before super() so it's included in the single DB save.
+            # The post_save signal in signals.py will then dispatch the task once.
             obj.processing_status = Book.ProcessingStatus.PENDING
             obj.processing_error = ''
-            obj.save(update_fields=['processing_status', 'processing_error'])
 
-            # Queue the background task
-            process_admin_book_pdf.delay(str(obj.id))
+        super().save_model(request, obj, form, change)  # one save → one signal fire
 
+        if pdf_changed:
             self.message_user(
                 request,
                 f'✅ PDF upload received for "{obj.title}". '

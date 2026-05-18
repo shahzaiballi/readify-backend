@@ -1,7 +1,6 @@
 from rest_framework import serializers
-from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook
+from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook, ReadingSchedule
 from django.contrib.auth.models import AnonymousUser
-from apps.books.tasks import process_user_uploaded_book
 
 
 
@@ -101,14 +100,18 @@ class ChapterSerializer(serializers.ModelSerializer):
     isLocked = serializers.BooleanField(source='is_locked')
     isCompleted = serializers.SerializerMethodField()
     isActive = serializers.SerializerMethodField()
+    chapterSource = serializers.SerializerMethodField()
 
     class Meta:
         model = Chapter
         fields = [
             'id', 'title', 'chapterNumber',
             'durationInMinutes', 'pageRange',
-            'isCompleted', 'isActive', 'isLocked',
+            'isCompleted', 'isActive', 'isLocked', 'chapterSource',
         ]
+
+    def get_chapterSource(self, obj):
+        return obj.book.chapter_source
 
     def get_isCompleted(self, obj):
         request = self.context.get('request')
@@ -133,10 +136,12 @@ class ChunkSerializer(serializers.ModelSerializer):
     """Matches ChunkEntity exactly."""
     chunkIndex = serializers.IntegerField(source='chunk_index')
     estimatedMinutes = serializers.IntegerField(source='estimated_minutes')
+    dayNumber = serializers.IntegerField(source='day_number')
+    wordsCount = serializers.IntegerField(source='words_count')
 
     class Meta:
         model = Chunk
-        fields = ['id', 'text', 'estimatedMinutes', 'chunkIndex']
+        fields = ['id', 'text', 'estimatedMinutes', 'chunkIndex', 'dayNumber', 'wordsCount']
 
 
 class SummarySerializer(serializers.ModelSerializer):
@@ -165,12 +170,18 @@ class FlashcardSerializer(serializers.ModelSerializer):
 
 # ── User Upload Serializers ───────────────────────────────────────────────────
 class UserUploadSerializer(serializers.ModelSerializer):
-    """✅ FIXED: Flutter PDF upload serializer - properly handles uploaded_by"""
+    """Flutter PDF upload serializer — includes reading preferences."""
     pdf_file = serializers.FileField()
+    reading_mode = serializers.ChoiceField(
+        choices=Book.ReadingMode.choices,
+        default=Book.ReadingMode.DEEP,
+        required=False,
+    )
+    daily_minutes = serializers.IntegerField(default=30, min_value=5, max_value=180, required=False)
 
     class Meta:
         model = UserUploadedBook
-        fields = ['title', 'author', 'pdf_file']
+        fields = ['title', 'author', 'pdf_file', 'reading_mode', 'daily_minutes']
     
     def validate_pdf_file(self, value):
         """Validate PDF size/extension"""
@@ -187,7 +198,7 @@ class UserUploadSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         request = self.context.get('request')
-        
+
         if request and request.user and not isinstance(request.user, AnonymousUser):
             validated_data['uploaded_by'] = request.user
         else:
@@ -197,25 +208,48 @@ class UserUploadSerializer(serializers.ModelSerializer):
             if system_user:
                 validated_data['uploaded_by'] = system_user
             else:
-                raise serializers.ValidationError("No authenticated user available")
+                raise serializers.ValidationError('No authenticated user available')
 
-        # ✅ Create upload
         upload = UserUploadedBook.objects.create(**validated_data)
 
-        # 🚀 TRIGGER CELERY TASK (THIS WAS MISSING)
-        process_user_uploaded_book.delay(str(upload.id))
+        # Trigger Stage 1: Extract + Detect (not old process_user_uploaded_book)
+        from apps.books.tasks import task_extract_and_detect
+        task_extract_and_detect.delay(str(upload.id))
 
         return upload
 
 
 class UserUploadStatusSerializer(serializers.ModelSerializer):
-    """Flutter polls this for processing status"""
+    """Flutter polls this for granular processing status."""
     bookId = serializers.SerializerMethodField()
     processingStatus = serializers.CharField(source='status')
+    processingStage = serializers.CharField(source='processing_stage')
+    totalPages = serializers.IntegerField(source='total_pages')
+    detectedChapters = serializers.SerializerMethodField()
 
     class Meta:
         model = UserUploadedBook
-        fields = ['id', 'title', 'processingStatus', 'bookId', 'error_message']
+        fields = [
+            'id', 'title', 'processingStatus', 'processingStage',
+            'bookId', 'error_message', 'totalPages', 'detectedChapters',
+        ]
 
     def get_bookId(self, obj):
         return str(obj.book.id) if obj.book else None
+
+    def get_detectedChapters(self, obj):
+        """Return toc_raw chapter count when awaiting confirmation."""
+        return len(obj.toc_raw) if obj.toc_raw else 0
+
+
+class ReadingScheduleSerializer(serializers.ModelSerializer):
+    """Serializes the reading schedule for GET /books/{id}/schedule/"""
+    bookId = serializers.UUIDField(source='book.id', read_only=True)
+    bookTitle = serializers.CharField(source='book.title', read_only=True)
+    startDate = serializers.DateField(source='start_date')
+    totalDays = serializers.IntegerField(source='total_days')
+    scheduleData = serializers.JSONField(source='schedule_data')
+
+    class Meta:
+        model = ReadingSchedule
+        fields = ['id', 'bookId', 'bookTitle', 'startDate', 'totalDays', 'scheduleData', 'created_at']

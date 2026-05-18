@@ -1,25 +1,22 @@
 """
 apps/books/tasks.py
 
-KEY FIX: Chunk generation is now deterministic and never relies on Claude
-to split text correctly. Claude is only used for title, summary, key takeaways,
-and flashcards — all of which are short and reliable. The actual reading chunks
-(pages) are always produced by our own sentence-aware word splitter, guaranteeing
-that a 17-page chapter always becomes ~17+ readable pages in the app.
+NEW 3-STAGE PIPELINE:
+  Stage 1 — task_extract_and_detect   : PDF extraction + 3-path chapter detection
+  Stage 2 — (user reviews chapters via Flutter — no task)
+  Stage 3 — task_build_reading_schedule: confirmed chapters → Chunk records + ReadingSchedule
 
-PREVIOUS BUG: Claude was asked to produce the chunks array directly.
-When the chapter text was long (or Claude was being conservative), it often
-returned the entire chapter as a single string in the chunks array, giving
-the user 1 page per chapter instead of 15-20.
+GOLDEN RULE: Never send >8,000 words to DeepSeek in a single call.
+All AI calls are in apps/book_intelligence/. This file is pure code — no AI.
 """
 
+import math
 import re
-import json
 import logging
 from datetime import timezone, datetime
 from celery import shared_task
 from django.db import transaction
-from django.conf import settings
+from django.utils import timezone as dj_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -156,247 +153,88 @@ def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     return pages
 
 
-def group_pages_into_chapters(pages: list[dict], pages_per_chapter: int = 17) -> list[dict]:
+def extract_chapter_text(pages_dict: dict, start_page: int, end_page: int) -> str:
+    """Extract and join text from a page range (start_page..end_page inclusive)."""
+    texts = []
+    for pn in range(start_page, end_page + 1):
+        if pn in pages_dict:
+            texts.append(pages_dict[pn])
+    return '\n\n'.join(texts)
+
+
+def _merge_small_chunks(chunks: list[str], min_words: int = 100) -> list[str]:
     """
-    Group flat PDF pages into logical chapters.
-
-    FIX: Default changed from 15 to 17 pages per chapter to match
-    the page ranges already shown in the Flutter UI (Pages 1-17, 18-34 etc.)
-    
-    If the PDF has fewer pages than pages_per_chapter, they all become chapter 1.
+    Merge any chunk shorter than min_words into the previous chunk.
+    Ensures minimum readable chunk size.
     """
-    if not pages:
-        return []
+    if not chunks:
+        return chunks
 
-    chapters = []
-    for i in range(0, len(pages), pages_per_chapter):
-        chapter_pages = pages[i:i + pages_per_chapter]
-        page_numbers = [p['page_number'] for p in chapter_pages]
-        full_text = '\n\n'.join(p['text'] for p in chapter_pages)
-        chapters.append({
-            'chapter_number': len(chapters) + 1,
-            'pages': page_numbers,
-            'page_range': f"Pages {page_numbers[0]}–{page_numbers[-1]}",
-            'text': full_text,
-            'page_count': len(chapter_pages),
-        })
-
-    logger.info(f"[PDF] Grouped {len(pages)} pages into {len(chapters)} chapters "
-                f"({pages_per_chapter} pages/chapter)")
-    return chapters
+    merged = [chunks[0]]
+    for chunk in chunks[1:]:
+        if len(chunk.split()) < min_words and merged:
+            merged[-1] = merged[-1] + ' ' + chunk
+        else:
+            merged.append(chunk)
+    return merged
 
 
-def group_pages_with_ai(pages: list[dict], book_title: str) -> tuple[list[dict], bool]:
-    """
-    Attempts to group pages based on the actual Table of Contents using AI.
-    Returns: (chapters_list, is_success)
-    """
-    if not pages:
-        return [], False
+# ── Private Helpers ───────────────────────────────────────────────────────────
 
-    from apps.book_intelligence.ai_client import detect_chapter_structure
-    
-    total_pages = len(pages)
-    # Extract first 40 pages to find the TOC
-    toc_pages = pages[:40]
-    toc_text = "\n\n".join([f"--- Page {p['page_number']} ---\n{p['text']}" for p in toc_pages])
+def _mark_upload_failed(upload, book, error_message: str, stage: str = 'failed'):
+    """Set both upload and book to FAILED status with detailed stage info."""
+    try:
+        upload.status = upload.Status.FAILED
+        upload.error_message = error_message
+        upload.processing_stage = stage
+        upload.save(update_fields=['status', 'error_message', 'processing_stage'])
+    except Exception as e:
+        logger.error(f'[_mark_failed] Could not update upload: {e}')
 
     try:
-        structure = detect_chapter_structure(book_title, toc_text, total_pages)
-        if not structure:
-            return [], False
-
-        chapters = []
-        for ch in structure:
-            start_page = ch.get('start_page', 1)
-            end_page = ch.get('end_page', total_pages)
-            
-            # Bound pages
-            start_page = max(1, start_page)
-            end_page = min(total_pages, end_page)
-
-            # Get the pages for this chapter
-            chapter_pages = [p for p in pages if start_page <= p['page_number'] <= end_page]
-            if not chapter_pages:
-                continue
-
-            full_text = '\n\n'.join(p['text'] for p in chapter_pages)
-            
-            chapters.append({
-                'chapter_number': ch.get('chapter_number', len(chapters) + 1),
-                'title': ch.get('title', f"Chapter {len(chapters) + 1}"),
-                'pages': [p['page_number'] for p in chapter_pages],
-                'page_range': f"Pages {start_page}–{end_page}",
-                'text': full_text,
-                'page_count': len(chapter_pages),
-            })
-
-        if not chapters:
-            return [], False
-
-        logger.info(f"[PDF AI] Successfully grouped {total_pages} pages into {len(chapters)} actual chapters!")
-        return chapters, True
+        book.processing_status = book.ProcessingStatus.FAILED
+        book.processing_error = error_message
+        book.save(update_fields=['processing_status', 'processing_error'])
     except Exception as e:
-        logger.warning(f"[PDF AI] Failed to group pages with AI: {e}")
-        return [], False
+        logger.error(f'[_mark_failed] Could not update book: {e}')
 
 
-# ── DeepSeek Integration for AI Metadata moved to lazy generation endpoint ──
+# ── STAGE 1: Extract & Detect ─────────────────────────────────────────────────
 
-
-def process_chapter(raw_chapter: dict, book_title: str) -> dict:
+@shared_task(bind=True, max_retries=3, default_retry_delay=60,
+             name='books.task_extract_and_detect')
+def task_extract_and_detect(self, upload_id: str):
     """
-    Process one chapter end-to-end:
-    1. Get metadata (title/summary/flashcards) from Claude
-    2. Split raw text into chunks deterministically (NEVER rely on Claude for this)
-    3. Return a complete chapter dict ready for save_book_content_to_db()
-
-    This function is the core fix. Separating concerns means:
-    - Claude handles semantics (what does this chapter mean?)
-    - Our code handles structure (how many pages should this chapter have?)
-    """
-    chapter_text = raw_chapter['text']
-    chapter_number = raw_chapter['chapter_number']
-    page_count = raw_chapter.get('page_count', 17)
-
-    # Note: AI metadata (summary, flashcards) is now generated LAZILY on demand
-    # when the user starts reading the chapter, not during upload.
-
-    # Step 2: Deterministic chunk splitting
-    # Target: ~3 chunks per page (each chunk ~2 min at 250 words)
-    # A 17-page chapter → ~17 chunks minimum, ideally 17-20
-    # We use 275 words/chunk so a 17-page chapter (17*275=4675 words) → ~17 chunks
-    words_per_chunk = 275
-    chunks = split_text_into_chunks(chapter_text, words_per_chunk=words_per_chunk)
-
-    # Safety: if text was very short (e.g. mostly images/scanned PDF),
-    # still produce at least 1 chunk with whatever text we have
-    if not chunks and chapter_text.strip():
-        chunks = [chapter_text.strip()]
-
-    logger.info(
-        f"[Process] Ch.{chapter_number} : "
-        f"{len(chapter_text.split())} words → {len(chunks)} chunks "
-        f"({page_count} PDF pages)"
-    )
-
-    return {
-        'chapter_number': chapter_number,
-        'page_range': raw_chapter.get('page_range', ''),
-        'title': f'Chapter {chapter_number}',
-        'summary': '',
-        'key_takeaways': [],
-        'flashcards': [],
-        'estimated_read_minutes': len(chunks) * 2,
-        # CHUNKS come from our deterministic splitter
-        'chunks': chunks,
-    }
-
-
-# ── Database Writer ────────────────────────────────────────────────────────────
-
-def save_book_content_to_db(book, chapters_data: list[dict]):
-    """
-    Wipe existing chapters/flashcards for this book and write fresh ones.
-    """
-    from apps.books.models import Chapter, Chunk, Summary, Flashcard
-
-    with transaction.atomic():
-        book.chapters.all().delete()
-        book.flashcards.all().delete()
-
-        total_flashcards = 0
-
-        for chapter_data in chapters_data:
-            chapter = Chapter.objects.create(
-                book=book,
-                chapter_number=chapter_data['chapter_number'],
-                title=chapter_data.get('title', f"Chapter {chapter_data['chapter_number']}"),
-                page_range=chapter_data.get('page_range', ''),
-                duration_in_minutes=chapter_data.get('estimated_read_minutes', 15),
-                is_locked=False,
-            )
-
-            chunks = chapter_data.get('chunks', [])
-            if not chunks:
-                logger.warning(
-                    f"[DB] Ch.{chapter_data['chapter_number']} has no chunks — "
-                    "skipping chunk creation"
-                )
-
-            for i, chunk_text in enumerate(chunks):
-                chunk_text = chunk_text.strip()
-                if not chunk_text:
-                    continue
-                word_count = len(chunk_text.split())
-                # Estimate reading time: average reader does ~200 words/min
-                estimated_minutes = max(1, round(word_count / 200))
-                Chunk.objects.create(
-                    chapter=chapter,
-                    chunk_index=i,
-                    text=chunk_text,
-                    estimated_minutes=estimated_minutes,
-                )
-
-            summary_text = chapter_data.get('summary', '').strip()
-            if summary_text:
-                Summary.objects.create(
-                    chapter=chapter,
-                    title=chapter.title,
-                    summary_content=summary_text,
-                    key_takeaways=chapter_data.get('key_takeaways', []),
-                    is_locked=False,
-                )
-
-            for fc in chapter_data.get('flashcards', []):
-                q = (fc.get('question') or '').strip()
-                a = (fc.get('answer') or '').strip()
-                if q and a:
-                    Flashcard.objects.create(book=book, question=q, answer=a)
-                    total_flashcards += 1
-
-        book.total_chapters = len(chapters_data)
-        book.flashcards_count = total_flashcards
-        book.save(update_fields=['total_chapters', 'flashcards_count'])
-
-    total_chunks = sum(len(c.get('chunks', [])) for c in chapters_data)
-    logger.info(
-        f"[DB] Saved {len(chapters_data)} chapters, "
-        f"{total_chunks} total chunks, "
-        f"{total_flashcards} flashcards for '{book.title}'"
-    )
-
-
-# ── Celery Tasks ───────────────────────────────────────────────────────────────
-
-@shared_task(bind=True, max_retries=2)
-def process_user_uploaded_book(self, upload_id: str):
-    """
-    Background task: read the PDF, process each chapter, persist results.
+    Stage 1: Extract PDF text, detect chapter structure via 3-path TOC detection.
+    Sets upload.status = AWAITING_CONFIRM when done.
+    No AI used for Path A (bookmarks) or Path B (text TOC).
+    AI only used as Path C last resort using page signals (~1,500 words max).
     """
     from apps.books.models import Book, UserUploadedBook
-    from apps.library.models import UserBook
-    from apps.books.cover_service import fetch_cover_image_url
+    from apps.books.toc_detector import (
+        detect_from_bookmarks, detect_from_text,
+        build_page_signals, validate_chapter_structure, build_manual_chapters,
+    )
+    from apps.book_intelligence.models import BookIntelligenceProfile, BookIntelligenceChapter
 
-    logger.info(f"[PDF Task] 🚀 Starting — upload_id={upload_id}")
+    logger.info(f'[Stage1] Starting — upload_id={upload_id}')
 
-    # ── 1. Fetch upload record ─────────────────────────────────────────────────
     try:
-        upload = UserUploadedBook.objects.select_related(
-            'uploaded_by', 'book'
-        ).get(id=upload_id)
+        upload = UserUploadedBook.objects.select_related('uploaded_by', 'book').get(id=upload_id)
     except UserUploadedBook.DoesNotExist:
-        logger.error(f"[PDF Task] ❌ Upload not found: {upload_id}")
+        logger.error(f'[Stage1] Upload {upload_id} not found')
         return
 
-    # ── 2. Ensure a Book record exists ─────────────────────────────────────────
+    # Ensure Book record exists
     if upload.book is None:
         book = Book.objects.create(
             title=upload.title,
             author=upload.author or 'Unknown Author',
             category='User Upload',
             source=Book.Source.USER_UPLOAD,
-            processing_status=Book.ProcessingStatus.PENDING,
+            processing_status=Book.ProcessingStatus.PROCESSING,
+            reading_mode=upload.reading_mode,
+            daily_minutes=upload.daily_minutes,
             is_published=True,
             is_recommended=False,
         )
@@ -404,106 +242,345 @@ def process_user_uploaded_book(self, upload_id: str):
         upload.save(update_fields=['book'])
     else:
         book = upload.book
+        book.reading_mode = upload.reading_mode
+        book.daily_minutes = upload.daily_minutes
+        book.save(update_fields=['reading_mode', 'daily_minutes'])
 
-    # ── 3. Auto-fetch cover image ──────────────────────────────────────────────
+    # Update status
+    upload.status = UserUploadedBook.Status.PROCESSING
+    upload.processing_stage = 'extracting'
+    upload.save(update_fields=['status', 'processing_stage'])
+    book.processing_status = Book.ProcessingStatus.PROCESSING
+    book.save(update_fields=['processing_status'])
+
+    # Extract cover if needed
     if not book.cover_image and not book.cover_image_url:
         cover_path = extract_first_page_as_image(upload.pdf_file.path)
         if cover_path:
             book.cover_image = cover_path
             book.save(update_fields=['cover_image'])
-            logger.info(f"[PDF Task] ✅ Cover extracted: {cover_path}")
 
-    # ── 4. Mark as processing ──────────────────────────────────────────────────
-    try:
-        upload.status = UserUploadedBook.Status.PROCESSING
-        upload.save(update_fields=['status'])
-        book.processing_status = Book.ProcessingStatus.PROCESSING
-        book.save(update_fields=['processing_status'])
-    except Exception as exc:
-        raise self.retry(exc=exc, countdown=30)
-
-    # ── 5. Extract PDF text ────────────────────────────────────────────────────
+    # Extract PDF text (all pages)
     try:
         pages = extract_text_from_pdf(upload.pdf_file.path)
     except Exception as exc:
-        logger.error(f"[PDF Task] ❌ PDF extraction failed: {exc}", exc_info=True)
-        _mark_failed(upload, book, str(exc))
-        raise self.retry(exc=exc, countdown=30)
+        logger.error(f'[Stage1] PDF extraction failed: {exc}', exc_info=True)
+        _mark_upload_failed(upload, book, str(exc), 'failed:extract')
+        raise self.retry(exc=exc)
 
     if not pages:
-        _mark_failed(upload, book, "PDF is empty or has no extractable text.")
+        _mark_upload_failed(upload, book, 'PDF has no extractable text.', 'failed:empty')
         return
 
-    logger.info(f"[PDF Task] Extracted {len(pages)} pages")
+    total_pages = len(pages)
+    upload.total_pages = total_pages
+    upload.processing_stage = 'detecting_chapters'
+    upload.save(update_fields=['total_pages', 'processing_stage'])
 
-    # ── 6. Group pages into chapters ───────────────────────────────────────────
-    raw_chapters, is_ai_success = group_pages_with_ai(pages, upload.title)
-    
-    if not is_ai_success:
-        logger.warning(f"[PDF Task] AI chapter grouping failed. Falling back to manual 17-page split.")
-        raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
-        book.description = "[Note: Chapters were manually split because the AI could not detect the Table of Contents]\n\n" + book.description
-        book.save(update_fields=['description'])
+    chapters = []
+    chapter_source = 'manual'
 
-    # ── 7. Process each chapter (Claude metadata + deterministic chunks) ────────
-    processed_chapters = []
-    for raw_ch in raw_chapters:
-        chapter_result = process_chapter(raw_ch, upload.title)
-        processed_chapters.append(chapter_result)
+    # ── Path A: PDF Bookmarks ─────────────────────────────────────────────────
+    upload.processing_stage = 'detecting:bookmarks'
+    upload.save(update_fields=['processing_stage'])
 
-    # ── 8. Save to database ────────────────────────────────────────────────────
-    try:
-        save_book_content_to_db(book, processed_chapters)
-    except Exception as exc:
-        logger.error(f"[PDF Task] ❌ DB save failed: {exc}", exc_info=True)
-        _mark_failed(upload, book, str(exc))
-        raise self.retry(exc=exc, countdown=30)
+    bookmark_chapters = detect_from_bookmarks(upload.pdf_file.path)
+    if bookmark_chapters and validate_chapter_structure(bookmark_chapters, total_pages):
+        chapters = bookmark_chapters
+        chapter_source = 'bookmarks'
+        logger.info(f'[Stage1] Path A: {len(chapters)} chapters from bookmarks')
 
-    # ── 9. Mark as completed ───────────────────────────────────────────────────
-    book.processing_status = Book.ProcessingStatus.COMPLETED
-    book.save(update_fields=['processing_status'])
+    # ── Path B: Text TOC ──────────────────────────────────────────────────────
+    if not chapters:
+        upload.processing_stage = 'detecting:text_toc'
+        upload.save(update_fields=['processing_stage'])
 
-    upload.status = UserUploadedBook.Status.COMPLETED
-    upload.processed_at = datetime.now(tz=timezone.utc)
-    upload.save(update_fields=['status', 'processed_at'])
+        text_chapters = detect_from_text(pages, total_pages)
+        if text_chapters and validate_chapter_structure(text_chapters, total_pages):
+            chapters = text_chapters
+            chapter_source = 'text_toc'
+            logger.info(f'[Stage1] Path B: {len(chapters)} chapters from text TOC')
 
-    # ── 10. Ensure library entry exists ───────────────────────────────────────
-    user_book, created = UserBook.objects.get_or_create(
-        user=upload.uploaded_by,
+    # ── Path C: AI Fallback (page signals only — never full book) ─────────────
+    if not chapters:
+        upload.processing_stage = 'detecting:ai_fallback'
+        upload.save(update_fields=['processing_stage'])
+
+        page_signals = build_page_signals(pages)
+        try:
+            from apps.book_intelligence.ai_client import detect_chapter_boundaries
+            ai_chapters = detect_chapter_boundaries(page_signals, total_pages, upload.title)
+            if ai_chapters and validate_chapter_structure(ai_chapters, total_pages):
+                chapters = ai_chapters
+                chapter_source = 'ai_generated'
+                logger.info(f'[Stage1] Path C: {len(chapters)} chapters from AI')
+        except Exception as exc:
+            logger.warning(f'[Stage1] AI fallback failed: {exc}')
+
+    # ── Final Fallback: deterministic 17-pages-per-chapter ───────────────────
+    if not chapters:
+        chapters = build_manual_chapters(pages, pages_per_chapter=17)
+        chapter_source = 'manual'
+        logger.info(f'[Stage1] Manual fallback: {len(chapters)} chapters')
+
+    # Persist chapter_source on Book
+    book.chapter_source = chapter_source
+    book.save(update_fields=['chapter_source'])
+
+    # Store toc_raw on upload for Flutter review
+    upload.toc_raw = chapters
+    upload.save(update_fields=['toc_raw'])
+
+    # Create / refresh BookIntelligenceProfile + BookIntelligenceChapter records
+    profile, _ = BookIntelligenceProfile.objects.get_or_create(
         book=book,
-        defaults={'status': UserBook.Status.NOT_STARTED},
+        defaults={'status': BookIntelligenceProfile.Status.PENDING},
     )
 
-    total_chunks = sum(len(c.get('chunks', [])) for c in processed_chapters)
+    with transaction.atomic():
+        profile.ai_chapters.all().delete()
+        for ch in chapters:
+            BookIntelligenceChapter.objects.create(
+                profile=profile,
+                chapter_number=ch['chapter_number'],
+                title=ch['title'],
+                start_page=ch['start_page'],
+                end_page=ch['end_page'],
+                page_range_display=ch.get(
+                    'page_range_display',
+                    f"Pages {ch['start_page']}–{ch['end_page']}"
+                ),
+                user_confirmed=False,
+            )
+
+    # Mark as awaiting user confirmation
+    upload.status = UserUploadedBook.Status.AWAITING_CONFIRM
+    upload.processing_stage = 'awaiting_confirm'
+    upload.save(update_fields=['status', 'processing_stage'])
+
     logger.info(
-        f"[PDF Task] ✅ DONE — '{upload.title}': "
-        f"{len(processed_chapters)} chapters, {total_chunks} chunks. "
-        f"UserBook {'created' if created else 'already existed'}."
+        f'[Stage1] ✅ Done — {len(chapters)} chapters detected via {chapter_source}. '
+        f'Awaiting user confirmation.'
     )
 
 
-@shared_task(bind=True, max_retries=2)
-def process_admin_book_pdf(self, book_id: str):
-    """
-    Background task for admin-uploaded books.
-    Uses the same process_chapter() function for consistent chunk generation.
-    """
-    from apps.books.models import Book
-    from apps.books.cover_service import fetch_cover_image_url
+# ── STAGE 3: Build Reading Schedule ──────────────────────────────────────────
 
-    logger.info(f"[Admin PDF Task] 🚀 Starting — book_id={book_id}")
+@shared_task(bind=True, max_retries=3, default_retry_delay=60,
+             name='books.task_build_reading_schedule')
+def task_build_reading_schedule(self, book_id: str, user_id: int):
+    """
+    Stage 3: Create Chapter + Chunk records from confirmed BookIntelligenceChapter data.
+    Uses daily_minutes × 200 wpm formula — no AI.
+    Triggers book brief generation on completion.
+    """
+    from apps.books.models import Book, Chapter, Chunk, UserUploadedBook, ReadingSchedule
+    from apps.book_intelligence.models import BookIntelligenceProfile
+
+    logger.info(f'[Stage3] Building reading schedule — book_id={book_id}')
 
     try:
         book = Book.objects.get(id=book_id)
     except Book.DoesNotExist:
-        logger.error(f"[Admin PDF Task] ❌ Book not found: {book_id}")
+        logger.error(f'[Stage3] Book {book_id} not found')
+        return
+
+    try:
+        profile = book.intelligence_profile
+    except BookIntelligenceProfile.DoesNotExist:
+        logger.error(f'[Stage3] No intelligence profile for book {book_id}')
+        return
+
+    # Get confirmed chapters (or all if none explicitly confirmed)
+    confirmed_chapters = profile.ai_chapters.filter(
+        user_confirmed=True
+    ).order_by('chapter_number')
+
+    if not confirmed_chapters.exists():
+        confirmed_chapters = profile.ai_chapters.all().order_by('chapter_number')
+
+    if not confirmed_chapters.exists():
+        logger.error(f'[Stage3] No chapters for book {book_id}')
+        return
+
+    # Resolve PDF path
+    pdf_path = None
+    try:
+        upload = book.user_upload_source
+        if upload and upload.pdf_file:
+            pdf_path = upload.pdf_file.path
+            upload.status = UserUploadedBook.Status.SCHEDULING
+            upload.processing_stage = 'building_schedule'
+            upload.save(update_fields=['status', 'processing_stage'])
+    except Exception:
+        pass
+    if not pdf_path and book.pdf_file:
+        pdf_path = book.pdf_file.path
+
+    if not pdf_path:
+        logger.error(f'[Stage3] No PDF path for book {book_id}')
+        return
+
+    # Extract all pages once and build lookup dict
+    pages = extract_text_from_pdf(pdf_path)
+    pages_dict = {p['page_number']: p['text'] for p in pages}
+
+    daily_minutes = book.daily_minutes or 30
+    words_per_session = daily_minutes * 200  # e.g. 30 min × 200 wpm = 6,000 words/day
+
+    schedule_data = []
+    current_day = 1
+    total_chunks_created = 0
+
+    # Wipe existing chapters/chunks for this book (idempotent)
+    with transaction.atomic():
+        book.chapters.all().delete()
+
+    with transaction.atomic():
+        for ai_ch in confirmed_chapters:
+            chapter_text = extract_chapter_text(
+                pages_dict, ai_ch.start_page, ai_ch.end_page
+            )
+            if not chapter_text.strip():
+                chapter_text = f'{ai_ch.title} — content not extractable.'
+
+            word_count = len(chapter_text.split())
+            estimated_chapter_minutes = max(1, round(word_count / 200))
+
+            chapter = Chapter.objects.create(
+                book=book,
+                chapter_number=ai_ch.chapter_number,
+                title=ai_ch.title,
+                page_range=ai_ch.page_range_display,
+                duration_in_minutes=estimated_chapter_minutes,
+                start_page=ai_ch.start_page,
+                end_page=ai_ch.end_page,
+                is_locked=False,
+            )
+
+            # Split using daily reading target; merge tiny trailing chunks
+            raw_chunks = split_text_into_chunks(
+                chapter_text, words_per_chunk=words_per_session
+            )
+            chunks_text = _merge_small_chunks(raw_chunks, min_words=100)
+
+            if not chunks_text and chapter_text.strip():
+                chunks_text = [chapter_text.strip()]
+
+            for i, chunk_text in enumerate(chunks_text):
+                chunk_text = chunk_text.strip()
+                if not chunk_text:
+                    continue
+
+                chunk_word_count = len(chunk_text.split())
+                estimated_minutes = max(1, round(chunk_word_count / 200))
+
+                chunk = Chunk.objects.create(
+                    chapter=chapter,
+                    chunk_index=i,
+                    text=chunk_text,
+                    estimated_minutes=estimated_minutes,
+                    day_number=current_day,
+                    words_count=chunk_word_count,
+                )
+
+                schedule_data.append({
+                    'day': current_day,
+                    'chunk_ids': [str(chunk.id)],
+                    'estimated_minutes': estimated_minutes,
+                    'chapter_number': ai_ch.chapter_number,
+                    'chapter_title': ai_ch.title,
+                })
+                current_day += 1
+                total_chunks_created += 1
+
+        # Update book totals
+        book.total_chapters = confirmed_chapters.count()
+        book.processing_status = Book.ProcessingStatus.COMPLETED
+        book.save(update_fields=['total_chapters', 'processing_status'])
+
+    # Persist ReadingSchedule
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        user = User.objects.get(id=user_id)
+        ReadingSchedule.objects.update_or_create(
+            user=user,
+            book=book,
+            defaults={
+                'schedule_data': schedule_data,
+                'total_days': current_day - 1,
+                'start_date': dj_timezone.now().date(),
+            },
+        )
+    except Exception as exc:
+        logger.warning(f'[Stage3] Could not save ReadingSchedule: {exc}')
+
+    # Ensure UserBook entry exists
+    from apps.library.models import UserBook
+    UserBook.objects.get_or_create(
+        user_id=user_id,
+        book=book,
+        defaults={'status': UserBook.Status.NOT_STARTED},
+    )
+
+    # Update upload status to PROCESSING (brief + summaries still pending)
+    try:
+        upload = book.user_upload_source
+        upload.status = UserUploadedBook.Status.PROCESSING
+        upload.processing_stage = 'generating_brief'
+        upload.save(update_fields=['status', 'processing_stage'])
+    except Exception:
+        pass
+
+    logger.info(
+        f'[Stage3] ✅ Schedule built: {current_day - 1} days, '
+        f'{total_chunks_created} chunks for "{book.title}"'
+    )
+
+    # Trigger Stage 4: Book Brief (then it triggers initial summaries)
+    try:
+        from apps.book_intelligence.tasks import generate_book_brief_task
+        generate_book_brief_task.delay(str(profile.id), user_id)
+    except Exception as exc:
+        logger.warning(f'[Stage3] Could not queue book brief task: {exc}')
+
+
+# ── Admin Book Processing (auto-confirm chapters) ────────────────────────────
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30,
+             name='books.process_admin_book_pdf')
+def process_admin_book_pdf(self, book_id: str):
+    """
+    Admin-uploaded book processing.
+    Auto-confirms detected chapters (no user review needed for admin books).
+    """
+    from apps.books.models import Book
+    from apps.books.cover_service import fetch_cover_image_url
+    from apps.books.toc_detector import (
+        detect_from_bookmarks, detect_from_text,
+        build_page_signals, validate_chapter_structure, build_manual_chapters,
+    )
+    from apps.book_intelligence.models import BookIntelligenceProfile, BookIntelligenceChapter
+
+    logger.info(f'[AdminPDF] Starting — book_id={book_id}')
+
+    try:
+        book = Book.objects.get(id=book_id)
+    except Book.DoesNotExist:
+        logger.error(f'[AdminPDF] Book {book_id} not found')
         return
 
     if not book.pdf_file:
-        logger.error(f"[Admin PDF Task] ❌ Book {book_id} has no PDF file.")
+        logger.error(f'[AdminPDF] Book {book_id} has no PDF file')
         return
 
-    # Auto-fetch cover image if missing
+    # Set PROCESSING immediately — must be first save so the post_save signal
+    # no longer sees PENDING and won't queue additional duplicate tasks.
+    book.processing_status = Book.ProcessingStatus.PROCESSING
+    book.save(update_fields=['processing_status'])
+
+    # Cover (safe now: status is PROCESSING, signal won't re-trigger)
     if not book.cover_image and not book.cover_image_url:
         cover_path = extract_first_page_as_image(book.pdf_file.path)
         if cover_path:
@@ -511,220 +588,189 @@ def process_admin_book_pdf(self, book_id: str):
             book.save(update_fields=['cover_image'])
         else:
             cover_url = fetch_cover_image_url(
-                title=book.title,
-                author=book.author,
-                pdf_path=book.pdf_file.path
+                title=book.title, author=book.author, pdf_path=book.pdf_file.path
             )
             if cover_url:
                 book.cover_image_url = cover_url
                 book.save(update_fields=['cover_image_url'])
 
-    book.processing_status = Book.ProcessingStatus.PROCESSING
-    book.save(update_fields=['processing_status'])
-
-    # Extract PDF pages
     try:
         pages = extract_text_from_pdf(book.pdf_file.path)
     except Exception as exc:
-        logger.error(f"[Admin PDF Task] ❌ PDF extraction failed: {exc}", exc_info=True)
+        logger.error(f'[AdminPDF] PDF extraction failed: {exc}', exc_info=True)
         book.processing_status = Book.ProcessingStatus.FAILED
         book.processing_error = str(exc)
         book.save(update_fields=['processing_status', 'processing_error'])
-        raise self.retry(exc=exc, countdown=30)
+        raise self.retry(exc=exc)
 
     if not pages:
         book.processing_status = Book.ProcessingStatus.FAILED
-        book.processing_error = "PDF is empty or has no extractable text."
+        book.processing_error = 'PDF has no extractable text.'
         book.save(update_fields=['processing_status', 'processing_error'])
         return
 
-    # Group and process chapters
-    raw_chapters, is_ai_success = group_pages_with_ai(pages, book.title)
-    if not is_ai_success:
-        logger.warning(f"[Admin PDF Task] AI chapter grouping failed. Falling back to manual 17-page split.")
-        raw_chapters = group_pages_into_chapters(pages, pages_per_chapter=17)
-        book.description = "[Note: Chapters were manually split because the AI could not detect the Table of Contents]\n\n" + book.description
-        book.save(update_fields=['description'])
-    processed_chapters = []
+    total_pages = len(pages)
 
-    for raw_ch in raw_chapters:
-        chapter_result = process_chapter(raw_ch, book.title)
-        processed_chapters.append(chapter_result)
+    # 3-path chapter detection
+    chapters = []
+    chapter_source = 'manual'
 
-    # Save to database
-    try:
-        save_book_content_to_db(book, processed_chapters)
-    except Exception as exc:
-        logger.error(f"[Admin PDF Task] ❌ DB save failed: {exc}", exc_info=True)
-        book.processing_status = Book.ProcessingStatus.FAILED
-        book.processing_error = str(exc)
-        book.save(update_fields=['processing_status', 'processing_error'])
-        raise self.retry(exc=exc, countdown=30)
+    bookmark_chapters = detect_from_bookmarks(book.pdf_file.path)
+    if bookmark_chapters and validate_chapter_structure(bookmark_chapters, total_pages):
+        chapters, chapter_source = bookmark_chapters, 'bookmarks'
+    else:
+        text_chapters = detect_from_text(pages, total_pages)
+        if text_chapters and validate_chapter_structure(text_chapters, total_pages):
+            chapters, chapter_source = text_chapters, 'text_toc'
+        else:
+            page_signals = build_page_signals(pages)
+            try:
+                from apps.book_intelligence.ai_client import detect_chapter_boundaries
+                ai_chapters = detect_chapter_boundaries(page_signals, total_pages, book.title)
+                if ai_chapters and validate_chapter_structure(ai_chapters, total_pages):
+                    chapters, chapter_source = ai_chapters, 'ai_generated'
+            except Exception as exc:
+                logger.warning(f'[AdminPDF] AI fallback failed: {exc}')
 
-    book.processing_status = Book.ProcessingStatus.COMPLETED
-    book.processing_error = ''
-    book.save(update_fields=['processing_status', 'processing_error'])
+    if not chapters:
+        chapters = build_manual_chapters(pages, pages_per_chapter=17)
+        chapter_source = 'manual'
 
-    total_chunks = sum(len(c.get('chunks', [])) for c in processed_chapters)
-    logger.info(
-        f"[Admin PDF Task] ✅ DONE — '{book.title}': "
-        f"{len(processed_chapters)} chapters, {total_chunks} total chunks."
+    book.chapter_source = chapter_source
+    book.save(update_fields=['chapter_source'])
+
+    # Create intelligence profile + auto-confirmed chapters
+    profile, _ = BookIntelligenceProfile.objects.get_or_create(
+        book=book,
+        defaults={'status': BookIntelligenceProfile.Status.PENDING},
     )
 
+    with transaction.atomic():
+        profile.ai_chapters.all().delete()
+        for ch in chapters:
+            BookIntelligenceChapter.objects.create(
+                profile=profile,
+                chapter_number=ch['chapter_number'],
+                title=ch['title'],
+                start_page=ch['start_page'],
+                end_page=ch['end_page'],
+                page_range_display=ch.get(
+                    'page_range_display',
+                    f"Pages {ch['start_page']}–{ch['end_page']}"
+                ),
+                user_confirmed=True,  # Auto-confirm for admin books
+            )
 
-# ── Private helpers ────────────────────────────────────────────────────────────
+    # Build schedule immediately (admin books use default reading prefs)
+    pages_dict = {p['page_number']: p['text'] for p in pages}
+    daily_minutes = book.daily_minutes or 30
+    words_per_session = daily_minutes * 200
 
-def _mark_failed(upload, book, error_message: str):
-    """Set both upload and book to FAILED status."""
-    try:
-        upload.status = upload.Status.FAILED
-        upload.error_message = error_message
-        upload.save(update_fields=['status', 'error_message'])
-    except Exception as e:
-        logger.error(f"[_mark_failed] Could not update upload: {e}")
+    from apps.books.models import Chapter, Chunk
+    with transaction.atomic():
+        book.chapters.all().delete()
+        current_day = 1
+        total_chunks = 0
 
-    try:
-        book.processing_status = book.ProcessingStatus.FAILED
-        book.processing_error = error_message
-        book.save(update_fields=['processing_status', 'processing_error'])
-    except Exception as e:
-        logger.error(f"[_mark_failed] Could not update book: {e}")
+        for ai_ch in profile.ai_chapters.all().order_by('chapter_number'):
+            chapter_text = extract_chapter_text(
+                pages_dict, ai_ch.start_page, ai_ch.end_page
+            )
+            if not chapter_text.strip():
+                chapter_text = ai_ch.title
 
-# ── Lazy AI Generation Tasks ───────────────────────────────────────────────────
-
-@shared_task(bind=True, max_retries=2)
-def generate_book_brief_task(self, book_id: str):
-    """
-    Generates a 1-paragraph book brief and saves it to the Book's description.
-    Uses DeepSeek V3.
-    """
-    from apps.books.models import Book
-    try:
-        book = Book.objects.get(id=book_id)
-        if book.description and not book.description.startswith('Uploaded by'):
-            return # Already generated
-
-        from openai import OpenAI
-        api_key = getattr(settings, 'DEEPSEEK_API_KEY', '')
-        if not api_key: return
-
-        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-        
-        # Get sample text from first chapter
-        first_chapter = book.chapters.order_by('chapter_number').first()
-        sample_text = ""
-        if first_chapter:
-            chunks = first_chapter.chunks.all()[:10]
-            sample_text = " ".join(c.text for c in chunks)[:4000]
-
-        prompt = f"""You are a book expert. Write a single, concise paragraph (max 4 sentences) summarizing the book "{book.title}" by {book.author}. 
-Here is a sample of the text to understand the context:
-{sample_text}
-
-Return only the paragraph text, no markdown, no quotes."""
-
-        response = client.chat.completions.create(
-            model='deepseek-chat',
-            messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=256,
-            temperature=0.3,
-        )
-
-        brief = response.choices[0].message.content.strip()
-        book.description = brief
-        book.save(update_fields=['description'])
-        logger.info(f"[Lazy AI] Generated book brief for '{book.title}'")
-
-    except Exception as exc:
-        logger.error(f"[Lazy AI] Book brief generation failed: {exc}")
-
-
-@shared_task(bind=True, max_retries=2)
-def generate_chapter_metadata_task(self, chapter_id: str):
-    """
-    Generates chapter summary, flashcards, and title lazily.
-    """
-    from apps.books.models import Chapter, Summary, Flashcard
-    try:
-        chapter = Chapter.objects.select_related('book').get(id=chapter_id)
-        
-        # Check if already generated
-        if hasattr(chapter, 'summary'):
-            return
-
-        from openai import OpenAI
-        api_key = getattr(settings, 'DEEPSEEK_API_KEY', '')
-        if not api_key: return
-
-        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-        
-        chunks = chapter.chunks.order_by('chunk_index')
-        chapter_text = " ".join(c.text for c in chunks)
-        preview_text = chapter_text[:8000]
-        if len(chapter_text) > 8000:
-            preview_text += '\n\n[...chapter continues...]'
-
-        prompt = f"""You are processing Chapter {chapter.chapter_number} of "{chapter.book.title}".
-
-<chapter_text>
-{preview_text}
-</chapter_text>
-
-Return ONLY valid JSON with NO markdown fences, NO extra text:
-{{
-  "title": "Descriptive chapter title (max 60 chars)",
-  "summary": "2-3 sentence summary of the main ideas in this chapter",
-  "key_takeaways": [
-    "Key insight 1 (1 sentence)",
-    "Key insight 2 (1 sentence)",
-    "Key insight 3 (1 sentence)"
-  ],
-  "flashcards": [
-    {{"question": "A question testing understanding of this chapter", "answer": "A clear concise answer"}},
-    {{"question": "Another question", "answer": "Another answer"}},
-    {{"question": "Third question", "answer": "Third answer"}}
-  ]
-}}"""
-
-        response = client.chat.completions.create(
-            model='deepseek-chat',
-            messages=[{'role': 'user', 'content': prompt}],
-            max_tokens=1024,
-            temperature=0.2,
-        )
-
-        response_text = response.choices[0].message.content.strip()
-        response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
-        response_text = re.sub(r'\s*```$', '', response_text)
-
-        result = json.loads(response_text)
-        
-        with transaction.atomic():
-            if result.get('title') and result['title'] != f'Chapter {chapter.chapter_number}':
-                chapter.title = result['title'][:255]
-                chapter.save(update_fields=['title'])
-                
-            Summary.objects.create(
-                chapter=chapter,
-                title=chapter.title,
-                summary_content=result.get('summary', ''),
-                key_takeaways=result.get('key_takeaways', []),
+            word_count = len(chapter_text.split())
+            chapter = Chapter.objects.create(
+                book=book,
+                chapter_number=ai_ch.chapter_number,
+                title=ai_ch.title,
+                page_range=ai_ch.page_range_display,
+                duration_in_minutes=max(1, round(word_count / 200)),
+                start_page=ai_ch.start_page,
+                end_page=ai_ch.end_page,
                 is_locked=False,
             )
-            
-            new_flashcards = []
-            for fc in result.get('flashcards', []):
-                q = (fc.get('question') or '').strip()
-                a = (fc.get('answer') or '').strip()
-                if q and a:
-                    new_flashcards.append(Flashcard(book=chapter.book, question=q, answer=a))
-            
-            if new_flashcards:
-                Flashcard.objects.bulk_create(new_flashcards)
-                chapter.book.flashcards_count += len(new_flashcards)
-                chapter.book.save(update_fields=['flashcards_count'])
 
-        logger.info(f"[Lazy AI] Generated metadata for Chapter {chapter.chapter_number} of '{chapter.book.title}'")
+            raw_chunks = split_text_into_chunks(chapter_text, words_per_chunk=words_per_session)
+            chunks_text = _merge_small_chunks(raw_chunks, min_words=100)
+            if not chunks_text and chapter_text.strip():
+                chunks_text = [chapter_text.strip()]
+
+            for i, chunk_text in enumerate(chunks_text):
+                chunk_text = chunk_text.strip()
+                if not chunk_text:
+                    continue
+                chunk_wc = len(chunk_text.split())
+                Chunk.objects.create(
+                    chapter=chapter,
+                    chunk_index=i,
+                    text=chunk_text,
+                    estimated_minutes=max(1, round(chunk_wc / 200)),
+                    day_number=current_day,
+                    words_count=chunk_wc,
+                )
+                current_day += 1
+                total_chunks += 1
+
+        book.total_chapters = len(chapters)
+        book.processing_status = Book.ProcessingStatus.COMPLETED
+        book.processing_error = ''
+        book.save(update_fields=['total_chapters', 'processing_status', 'processing_error'])
+
+    logger.info(
+        f'[AdminPDF] ✅ Done — "{book.title}": '
+        f'{len(chapters)} chapters, {total_chunks} chunks via {chapter_source}'
+    )
+
+    # Trigger book brief generation
+    try:
+        from apps.book_intelligence.tasks import generate_book_brief_task
+        generate_book_brief_task.delay(str(profile.id), None)
+    except Exception as exc:
+        logger.warning(f'[AdminPDF] Could not queue book brief: {exc}')
+
+
+# ── Legacy alias for admin signal compatibility ───────────────────────────────
+
+@shared_task(bind=True, max_retries=2, name='books.process_user_uploaded_book')
+def process_user_uploaded_book(self, upload_id: str):
+    """
+    Alias kept for backwards compatibility with any existing queued tasks.
+    Delegates to task_extract_and_detect.
+    """
+    task_extract_and_detect.apply_async(args=[upload_id])
+
+
+# ── Lazy Chapter Metadata (legacy endpoint support) ───────────────────────────
+
+@shared_task(bind=True, max_retries=2, name='books.generate_chapter_metadata')
+def generate_chapter_metadata_task(self, chapter_id: str):
+    """
+    Generates chapter summary + flashcards lazily when user opens a chapter.
+    Uses the BookIntelligence pipeline — checks ChapterIntelligence first.
+    """
+    from apps.books.models import Chapter
+    try:
+        chapter = Chapter.objects.select_related('book').get(id=chapter_id)
+        if hasattr(chapter, 'summary') and chapter.summary:
+            return
+
+        # Delegate to book_intelligence pipeline for the user's reading mode
+        from apps.book_intelligence.models import (
+            BookIntelligenceChapter, ChapterIntelligence
+        )
+        reading_mode = chapter.book.reading_mode or 'deep'
+
+        ai_chapter = BookIntelligenceChapter.objects.filter(
+            profile__book=chapter.book,
+            chapter_number=chapter.chapter_number,
+        ).first()
+
+        if ai_chapter and not ChapterIntelligence.objects.filter(
+            ai_chapter=ai_chapter, mode=reading_mode
+        ).exists():
+            from apps.book_intelligence.tasks import generate_chapter_intelligence_task
+            generate_chapter_intelligence_task.delay(str(ai_chapter.id), reading_mode)
 
     except Exception as exc:
-        logger.error(f"[Lazy AI] Chapter metadata generation failed: {exc}")
+        logger.error(f'[ChapterMeta] Failed: {exc}')

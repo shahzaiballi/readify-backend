@@ -13,6 +13,7 @@ urlpatterns = [
 
     # AI Chapter structure
     path('books/<uuid:book_id>/chapters/', views.AIChaptersView.as_view(), name='ai-chapters'),
+    path('books/<uuid:book_id>/chapters/confirm/', views.ConfirmChaptersView.as_view(), name='confirm-chapters'),
     path('books/<uuid:book_id>/chapters/<uuid:chapter_id>/', views.AIChapterDetailView.as_view(), name='ai-chapter-detail'),
 
     # Chapter summary by reading mode

@@ -7,18 +7,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook
+from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook, ReadingSchedule
 from .serializers import (
-    BookListSerializer, BookDetailSerializer,
-    ChapterSerializer, ChunkSerializer,
-    SummarySerializer, FlashcardSerializer,
-    UserUploadSerializer, UserUploadStatusSerializer,
+    BookListSerializer,
+    BookDetailSerializer,
+    ChapterSerializer,
+    ChunkSerializer,
+    SummarySerializer,
+    FlashcardSerializer,
+    UserUploadSerializer,
+    UserUploadStatusSerializer,
+    ReadingScheduleSerializer,
 )
-from .tasks import (
-    process_user_uploaded_book, 
-    generate_book_brief_task, 
-    generate_chapter_metadata_task
-)
+from .tasks import generate_chapter_metadata_task
 
 
 class BookListView(APIView):
@@ -90,12 +91,14 @@ class BookDetailView(APIView):
         except Book.DoesNotExist:
             return Response({'error': 'Book not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # Lazy AI: Generate Book Brief if missing
-        if not book.description or book.description.startswith('Uploaded by'):
-            try:
-                generate_book_brief_task.delay(str(book.id))
-            except Exception as e:
-                logger.error(f"Failed to queue book brief generation: {e}")
+        # Lazy AI: trigger book brief via intelligence pipeline if profile exists but brief missing
+        try:
+            profile = book.intelligence_profile
+            if profile and not profile.book_brief:
+                from apps.book_intelligence.tasks import generate_book_brief_task
+                generate_book_brief_task.delay(str(profile.id), None)
+        except Exception:
+            pass
 
         serializer = BookDetailSerializer(book, context={'request': request})
         return Response(serializer.data)
@@ -150,6 +153,28 @@ class ChapterChunksView(APIView):
         return Response(serializer.data)
 
 
+def _extract_summary_content(content: dict, mode: str) -> tuple:
+    """Map ChapterIntelligence content dict → (summaryContent, keyTakeaways)."""
+    if mode == 'skim':
+        return content.get('one_liner', ''), []
+    elif mode == 'concept':
+        concepts = content.get('concepts', [])
+        summary = '; '.join(c.get('name', '') for c in concepts[:3])
+        takeaways = [
+            f"{c.get('name', '')}: {c.get('description', '')}"
+            for c in concepts
+        ]
+        return summary, takeaways
+    elif mode == 'deep':
+        return content.get('overview', ''), content.get('key_points', [])
+    elif mode == 'exam':
+        qa_pairs = content.get('qa_pairs', [])
+        summary = f"{len(qa_pairs)} study questions"
+        takeaways = [f"Q: {qa.get('question', '')}" for qa in qa_pairs]
+        return summary, takeaways
+    return '', []
+
+
 class BookSummariesView(APIView):
     """GET /books/{id}/summaries/"""
     permission_classes = [IsAuthenticated]
@@ -160,12 +185,34 @@ class BookSummariesView(APIView):
         except Book.DoesNotExist:
             return Response({'error': 'Book not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        summaries = Summary.objects.filter(
-            chapter__book=book
-        ).select_related('chapter').order_by('chapter__chapter_number')
+        from apps.book_intelligence.models import ChapterIntelligence
+        reading_mode = book.reading_mode or 'deep'
+        try:
+            profile = book.intelligence_profile
+        except Exception:
+            return Response([])
 
-        serializer = SummarySerializer(summaries, many=True)
-        return Response(serializer.data)
+        summaries = []
+        for ai_ch in profile.ai_chapters.order_by('chapter_number'):
+            try:
+                intel = ChapterIntelligence.objects.get(
+                    ai_chapter=ai_ch, mode=reading_mode
+                )
+                summary_content, key_takeaways = _extract_summary_content(
+                    intel.content or {}, reading_mode
+                )
+                summaries.append({
+                    'id': str(intel.id),
+                    'chapterNumber': ai_ch.chapter_number,
+                    'title': ai_ch.title,
+                    'summaryContent': summary_content,
+                    'keyTakeaways': key_takeaways,
+                    'isLocked': False,
+                })
+            except ChapterIntelligence.DoesNotExist:
+                pass
+
+        return Response(summaries)
 
 
 class BookFlashcardsView(APIView):
@@ -178,9 +225,33 @@ class BookFlashcardsView(APIView):
         except Book.DoesNotExist:
             return Response({'error': 'Book not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        flashcards = book.flashcards.all()
-        serializer = FlashcardSerializer(flashcards, many=True)
-        return Response(serializer.data)
+        from apps.book_intelligence.models import ChapterIntelligence
+        import uuid
+        try:
+            profile = book.intelligence_profile
+        except Exception:
+            return Response([])
+
+        flashcards = []
+        for ai_ch in profile.ai_chapters.order_by('chapter_number'):
+            try:
+                intel = ChapterIntelligence.objects.get(
+                    ai_chapter=ai_ch, mode='exam'
+                )
+                for i, qa in enumerate(intel.content.get('qa_pairs', [])):
+                    deterministic_id = str(uuid.uuid5(
+                        uuid.UUID(str(intel.id)), str(i)
+                    ))
+                    flashcards.append({
+                        'id': deterministic_id,
+                        'bookId': str(book.id),
+                        'question': qa.get('question', ''),
+                        'answer': qa.get('answer', ''),
+                    })
+            except ChapterIntelligence.DoesNotExist:
+                pass
+
+        return Response(flashcards)
 
 
 class ChunkSummaryView(APIView):
@@ -229,99 +300,66 @@ Return only the summary text, no markdown."""
 
 class UserBookUploadView(APIView):
     """
-    POST /books/upload/
+    POST /api/v1/books/upload/
 
-    Accepts PDF uploads from users and queues background AI processing.
-    
-    Changes vs original:
-    - Cover image is extracted from the first page of the PDF by the Celery task
-      (more reliable than external APIs). This ensures all user uploads get a
-      visual representation, even if external cover services are unavailable.
-    - Book is immediately visible in the library, but processing happens in background.
+    Accepts a PDF from the Flutter AddBookPage.
+    Required fields: title, pdf_file, reading_mode, daily_minutes
+    Creates UserUploadedBook, triggers Stage 1 (extract + detect chapters).
+    Returns upload record with status=PENDING.
     """
-    parser_classes = [MultiPartParser, FormParser]
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        logger.info(
-            f"📤 UPLOAD HIT! User: {request.user}, "
-            f"Files: {list(request.FILES.keys())}, "
-            f"Data: {dict(request.data)}"
-        )
-
         serializer = UserUploadSerializer(data=request.data, context={'request': request})
-
-        if not serializer.is_valid():
-            logger.error(f"❌ Upload validation errors: {serializer.errors}")
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        title = serializer.validated_data['title']
-        author = serializer.validated_data.get('author', '')
-
-        # ── Step 1: Create the Book placeholder (no cover yet) ─────────────────
-        # We skip external cover fetching here and let the Celery task handle it.
-        # This way, user uploads get the actual PDF first page as cover
-        # (which is more reliable than external APIs).
-        book = Book.objects.create(
-            title=title,
-            author=author or 'Unknown Author',
-            category='User Upload',
-            source=Book.Source.USER_UPLOAD,
-            processing_status=Book.ProcessingStatus.PENDING,
-            is_published=True,
-            is_recommended=False,
-            is_trending=False,
-            description=f'Uploaded by {request.user.email}',
-            # No cover set here — Celery task will extract from PDF
-        )
-        logger.info(f"📚 Created placeholder Book: {book.id} — '{book.title}'")
-
-        # ── Step 2: Create the UserUploadedBook record ────────────────────────
-        upload = UserUploadedBook.objects.create(
-            uploaded_by=request.user,
-            title=title,
-            author=author,
-            pdf_file=serializer.validated_data['pdf_file'],
-            book=book,
-            status=UserUploadedBook.Status.PENDING,
-        )
-        logger.info(f"📄 Created UserUploadedBook: {upload.id}, book={book.id}")
-
-        # ── Step 3: Add book to user's library immediately ────────────────────
-        from apps.library.models import UserBook
-        user_book, created = UserBook.objects.get_or_create(
-            user=request.user,
-            book=book,
-            defaults={'status': UserBook.Status.NOT_STARTED},
-        )
-        logger.info(
-            f"📖 UserBook {'created' if created else 'already existed'}: "
-            f"user={request.user.email}, book={book.id}"
-        )
-
-        # ── Step 4: Queue background PDF processing ───────────────────────────
-        process_user_uploaded_book.delay(str(upload.id))
-        logger.info(f"⚙️  Celery task queued for upload {upload.id}")
-
-        return Response(
-            {
-                'message': '✅ Upload accepted — Cover will be extracted from PDF during processing.',
-                'id': str(upload.id),
-                'book_id': str(book.id),
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
+        if serializer.is_valid():
+            upload = serializer.save()
+            return Response(
+                UserUploadStatusSerializer(upload).data,
+                status=status.HTTP_201_CREATED,
+            )
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class UserUploadStatusView(APIView):
-    """GET /books/upload/<id>/status/ — Flutter polls this"""
-    permission_classes = [AllowAny]
+    """
+    GET /api/v1/books/upload/<upload_id>/status/
+
+    Flutter polls this to track processing progress.
+    Returns processingStage for granular status (e.g. 'awaiting_confirm').
+    """
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, upload_id):
         try:
-            upload = UserUploadedBook.objects.get(id=upload_id)
+            upload = UserUploadedBook.objects.select_related('book').get(
+                id=upload_id,
+                uploaded_by=request.user,
+            )
         except UserUploadedBook.DoesNotExist:
-            return Response({'error': 'Upload not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'Upload not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = UserUploadStatusSerializer(upload)
-        return Response(serializer.data)
+        return Response(UserUploadStatusSerializer(upload).data)
+
+
+class ReadingScheduleView(APIView):
+    """
+    GET /api/v1/books/<book_id>/schedule/
+
+    Returns the user's reading schedule for a book.
+    Schedule is created after chapter confirmation (Stage 3).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, book_id):
+        try:
+            schedule = ReadingSchedule.objects.select_related('book').get(
+                book_id=book_id,
+                user=request.user,
+            )
+        except ReadingSchedule.DoesNotExist:
+            return Response(
+                {'error': 'No reading schedule found. Complete chapter confirmation first.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(ReadingScheduleSerializer(schedule).data)

@@ -97,7 +97,7 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 def find_relevant_chunks(
     profile_id: str,
     question: str,
-    top_k: int = 5,
+    top_k: int = 3,
 ) -> list[dict]:
     """
     Find the most relevant text chunks for a question using cosine similarity.

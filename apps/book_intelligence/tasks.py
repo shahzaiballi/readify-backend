@@ -30,7 +30,7 @@ def classify_and_structure_book(self, book_id: str):
     from apps.book_intelligence.models import (
         BookIntelligenceProfile, BookIntelligenceChapter
     )
-    from apps.book_intelligence.ai_client import classify_book, detect_chapter_structure
+    from apps.book_intelligence.ai_client import classify_book
 
     logger.info(f'[Intelligence] 🚀 classify_and_structure_book — book_id={book_id}')
 
@@ -86,50 +86,35 @@ def classify_and_structure_book(self, book_id: str):
     except Exception as exc:
         logger.warning(f'[Intelligence] Classification failed: {exc} — using defaults')
 
-    # Step 1b: Detect chapter structure
-    existing_chapters = list(chapters.values(
-        'chapter_number', 'title', 'page_range'
-    ))
-
-    try:
-        structured = detect_chapter_structure(book.title, text_sample, existing_chapters)
-    except Exception as exc:
-        logger.warning(f'[Intelligence] Structure detection failed: {exc} — using existing')
-        structured = [
-            {
-                'chapter_number': ch['chapter_number'],
-                'title': ch['title'],
-                'start_page': 1,
-                'end_page': 17,
-                'hook': f"Explore chapter {ch['chapter_number']} of {book.title}",
-            }
-            for ch in existing_chapters
-        ]
-
-    # Save AI chapters
-    with transaction.atomic():
-        profile.ai_chapters.all().delete()
-        for ch_data in structured:
-            ch_num = ch_data.get('chapter_number', 1)
-            # Find the matching existing chapter for page range display
-            existing = next(
-                (c for c in existing_chapters if c['chapter_number'] == ch_num),
-                {}
-            )
-            BookIntelligenceChapter.objects.create(
-                profile=profile,
-                chapter_number=ch_num,
-                title=ch_data.get('title', f'Chapter {ch_num}'),
-                start_page=ch_data.get('start_page', 1),
-                end_page=ch_data.get('end_page', 17),
-                page_range_display=existing.get('page_range', ''),
-                chapter_hook=ch_data.get('hook', ''),
-            )
-
-    logger.info(
-        f'[Intelligence] ✅ Structured "{book.title}": '
-        f'{len(structured)} AI chapters saved'
-    )
+    # Step 1b: Sync AI chapters from existing Chapter records if not already populated
+    # (Stage 1 task_extract_and_detect already creates BookIntelligenceChapter records;
+    #  this is a fallback for books processed via the legacy /analyze/ endpoint)
+    if not profile.ai_chapters.exists():
+        existing_chapters = list(chapters.values(
+            'chapter_number', 'title', 'page_range'
+        ))
+        with transaction.atomic():
+            for ch in existing_chapters:
+                BookIntelligenceChapter.objects.get_or_create(
+                    profile=profile,
+                    chapter_number=ch['chapter_number'],
+                    defaults={
+                        'title': ch['title'],
+                        'start_page': 1,
+                        'end_page': 17,
+                        'page_range_display': ch.get('page_range', ''),
+                        'user_confirmed': True,
+                    },
+                )
+        logger.info(
+            f'[Intelligence] Synced {chapters.count()} chapters from Book '
+            f'records for "{book.title}"'
+        )
+    else:
+        logger.info(
+            f'[Intelligence] AI chapters already exist for "{book.title}" '
+            f'— skipping sync'
+        )
 
     # Step 1c: Queue embedding build
     profile.status = BookIntelligenceProfile.Status.EMBEDDING
@@ -169,13 +154,14 @@ def build_rag_embeddings_task(self, profile_id: str, book_id: str):
 
 
 @shared_task(bind=True, max_retries=2, name='book_intelligence.generate_book_brief')
-def generate_book_brief_task(self, profile_id: str):
+def generate_book_brief_task(self, profile_id: str, user_id=None):
     """
-    Generate Book Brief on first open. Cached permanently.
-    Triggered by GET /intelligence/books/<book_id>/brief/ on cache miss.
+    Stage 4: Generate Book Brief using chapter titles + first 150 words per chapter.
+    Input size: ~800 words max — well within 8k limit.
+    Triggers initial summary generation for chapters 1-3 on completion.
     """
     from apps.book_intelligence.models import BookIntelligenceProfile
-    from apps.books.models import Summary
+    from apps.books.models import Chunk
     from apps.book_intelligence.ai_client import generate_book_brief
 
     logger.info(f'[Intelligence] 📚 Generating Book Brief — profile={profile_id}')
@@ -188,30 +174,61 @@ def generate_book_brief_task(self, profile_id: str):
 
     if profile.book_brief:
         logger.info(f'[Intelligence] Brief already exists — skipping')
+        # Still trigger initial summaries if user_id provided
+        if user_id:
+            generate_initial_summaries_task.delay(profile_id, user_id)
         return
 
-    # Collect chapter summaries from existing apps.books summaries
-    summaries = Summary.objects.filter(
-        chapter__book=profile.book
-    ).order_by('chapter__chapter_number').values_list('summary_content', flat=True)
+    # Build chapter_openings: title + first 150 words of each chapter
+    chapter_openings = []
+    for ai_ch in profile.ai_chapters.all().order_by('chapter_number')[:12]:
+        from apps.books.models import Chapter
+        try:
+            ch = Chapter.objects.get(
+                book=profile.book, chapter_number=ai_ch.chapter_number
+            )
+            first_chunks = Chunk.objects.filter(chapter=ch).order_by('chunk_index')[:1]
+            opening_text = ' '.join(c.text for c in first_chunks)
+            # Truncate to first 150 words
+            opening_words = opening_text.split()[:150]
+            opening = ' '.join(opening_words)
+        except Chapter.DoesNotExist:
+            opening = ai_ch.chapter_hook or ''
 
-    chapter_summaries = list(summaries[:12])
+        chapter_openings.append({'title': ai_ch.title, 'opening': opening})
 
-    if not chapter_summaries:
-        # Fall back to AI chapter hooks
-        hooks = profile.ai_chapters.values_list('chapter_hook', flat=True)
-        chapter_summaries = list(hooks[:12])
+    if not chapter_openings:
+        logger.warning(f'[Intelligence] No chapters for brief — profile={profile_id}')
+        return
 
     try:
         brief = generate_book_brief(
             book_title=profile.book.title,
             book_author=profile.book.author,
-            chapter_summaries=chapter_summaries,
+            chapter_openings=chapter_openings,
         )
         profile.book_brief = brief
         profile.brief_generated_at = datetime.now(tz=timezone.utc)
         profile.save(update_fields=['book_brief', 'brief_generated_at'])
         logger.info(f'[Intelligence] ✅ Book Brief generated for "{profile.book.title}"')
+
+        # Mark upload as completed
+        try:
+            from apps.books.models import UserUploadedBook
+            upload = profile.book.user_upload_source
+            if upload:
+                upload.status = UserUploadedBook.Status.COMPLETED
+                upload.processing_stage = 'completed'
+                from datetime import timezone as tz
+                upload.processed_at = datetime.now(tz=tz.utc)
+                upload.save(update_fields=['status', 'processing_stage', 'processed_at'])
+        except Exception:
+            pass
+
+        # Trigger initial summaries for chapters 1-3
+        if user_id:
+            generate_initial_summaries_task.delay(profile_id, user_id)
+
     except Exception as exc:
         logger.error(f'[Intelligence] Book Brief generation failed: {exc}', exc_info=True)
         raise self.retry(exc=exc, countdown=30)
@@ -220,12 +237,16 @@ def generate_book_brief_task(self, profile_id: str):
 @shared_task(bind=True, max_retries=2, name='book_intelligence.generate_chapter_intelligence')
 def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
     """
-    Generate chapter intelligence for a specific reading mode.
-    Triggered when user opens a chapter in that mode.
+    Stage 5 (lazy): Generate chapter intelligence for a specific reading mode.
+    GOLDEN RULE: If chapter > 8,000 words, splits into 6,000-word sections,
+    summarises each, then synthesises into one final response.
+    Triggered when user opens a chapter.
     """
     from apps.book_intelligence.models import BookIntelligenceChapter, ChapterIntelligence
-    from apps.books.models import Chunk
-    from apps.book_intelligence.ai_client import generate_chapter_summary_for_mode
+    from apps.books.models import Chunk, Chapter
+    from apps.book_intelligence.ai_client import (
+        generate_chapter_summary_for_mode, synthesise_section_summaries
+    )
 
     logger.info(f'[Intelligence] 📖 Generating {mode} mode — chapter={ai_chapter_id}')
 
@@ -237,18 +258,14 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
         logger.error(f'[Intelligence] AI Chapter {ai_chapter_id} not found')
         return
 
-    # Check if already generated
     if ChapterIntelligence.objects.filter(ai_chapter=ai_chapter, mode=mode).exists():
         logger.info(f'[Intelligence] {mode} already cached — skipping')
         return
 
-    # Get chapter text from existing chunks
-    book_id = ai_chapter.profile.book_id
-    # Match chapter by number
-    from apps.books.models import Chapter
+    # Get chapter text from Chunk records
     try:
         existing_chapter = Chapter.objects.get(
-            book_id=book_id,
+            book_id=ai_chapter.profile.book_id,
             chapter_number=ai_chapter.chapter_number,
         )
         chunks = Chunk.objects.filter(chapter=existing_chapter).order_by('chunk_index')
@@ -256,26 +273,103 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
     except Chapter.DoesNotExist:
         chapter_text = ai_chapter.chapter_hook or f'Chapter {ai_chapter.chapter_number}'
 
+    book_title = ai_chapter.profile.book.title
+    chapter_title = ai_chapter.title
+    word_count = len(chapter_text.split())
+
     try:
-        content = generate_chapter_summary_for_mode(
-            chapter_title=ai_chapter.title,
-            chapter_text=chapter_text,
-            mode=mode,
-            book_title=ai_chapter.profile.book.title,
-        )
+        if word_count <= 8000:
+            # Short chapter: single AI call
+            content = generate_chapter_summary_for_mode(
+                chapter_title=chapter_title,
+                chapter_text=chapter_text,
+                mode=mode,
+                book_title=book_title,
+            )
+        else:
+            # Long chapter: split into 6,000-word sections, summarise each, synthesise
+            logger.info(
+                f'[Intelligence] Chapter "{chapter_title}" is {word_count} words — '
+                f'splitting into sections'
+            )
+            words = chapter_text.split()
+            section_size = 6000
+            sections = [
+                ' '.join(words[i:i + section_size])
+                for i in range(0, len(words), section_size)
+            ]
+            section_summaries = []
+            for sec_text in sections:
+                sec_result = generate_chapter_summary_for_mode(
+                    chapter_title=chapter_title,
+                    chapter_text=sec_text,
+                    mode=mode,
+                    book_title=book_title,
+                )
+                # Convert dict summary to string for synthesis input
+                import json as _json
+                section_summaries.append(_json.dumps(sec_result))
+
+            content = synthesise_section_summaries(
+                section_summaries=section_summaries,
+                mode=mode,
+                chapter_title=chapter_title,
+                book_title=book_title,
+            )
+            if not content:
+                # Fallback: use first section result if synthesis fails
+                content = generate_chapter_summary_for_mode(
+                    chapter_title=chapter_title,
+                    chapter_text=' '.join(words[:6000]),
+                    mode=mode,
+                    book_title=book_title,
+                )
+
         ChapterIntelligence.objects.create(
             ai_chapter=ai_chapter,
             mode=mode,
             content=content,
         )
-        logger.info(f'[Intelligence] ✅ {mode} mode generated for "{ai_chapter.title}"')
+        logger.info(f'[Intelligence] ✅ {mode} mode generated for "{chapter_title}"')
     except Exception as exc:
         logger.error(f'[Intelligence] Chapter intelligence failed: {exc}', exc_info=True)
         raise self.retry(exc=exc, countdown=30)
 
 
+@shared_task(bind=True, max_retries=2, name='book_intelligence.generate_initial_summaries')
+def generate_initial_summaries_task(self, profile_id: str, user_id: int):
+    """
+    Stage 5 (pre-gen): Generate summaries for chapters 1-3 in the user's chosen mode.
+    Called after book brief is generated. All other chapters are lazy.
+    """
+    from apps.book_intelligence.models import BookIntelligenceProfile, ChapterIntelligence
+
+    logger.info(f'[Intelligence] ⚡ Pre-generating summaries 1-3 — profile={profile_id}')
+
+    try:
+        profile = BookIntelligenceProfile.objects.select_related('book').get(id=profile_id)
+    except BookIntelligenceProfile.DoesNotExist:
+        logger.error(f'[Intelligence] Profile {profile_id} not found')
+        return
+
+    reading_mode = profile.book.reading_mode or 'deep'
+    first_three = profile.ai_chapters.order_by('chapter_number')[:3]
+
+    for ai_ch in first_three:
+        if not ChapterIntelligence.objects.filter(
+            ai_chapter=ai_ch, mode=reading_mode
+        ).exists():
+            generate_chapter_intelligence_task.delay(str(ai_ch.id), reading_mode)
+            logger.info(
+                f'[Intelligence] Queued {reading_mode} for Ch.{ai_ch.chapter_number} '
+                f'"{ai_ch.title}"'
+            )
+
+    logger.info(f'[Intelligence] ✅ Initial summary generation queued for {profile.book.title}')
+
+
 @shared_task(bind=True, max_retries=2, name='book_intelligence.generate_daily_notifications')
-def generate_daily_notifications_task(self, profile_id: str, user_id: int, target_date: str = None):
+def generate_daily_notifications_task(self, profile_id: str, user_id: int, target_date: str = None):  # noqa: E501
     """
     Generate 4 daily notification pieces for a user/book/day.
     target_date: ISO format date string, defaults to today.
@@ -305,45 +399,71 @@ def generate_daily_notifications_task(self, profile_id: str, user_id: int, targe
         logger.info(f'[Intelligence] Notifications already exist for {notification_date}')
         return
 
-    # Determine which chapter to use (cycle through chapters)
-    total_chapters = profile.ai_chapters.count()
-    if total_chapters == 0:
-        logger.warning(f'[Intelligence] No AI chapters for profile {profile_id}')
-        return
+    # Determine which chunk the user should be reading tomorrow
+    from apps.books.models import ReadingSchedule
 
-    from apps.library.models import UserBook
-    from apps.reading.models import ReadingProgress
+    ai_chapter = None
+    chapter_text = ''
 
-    # Try to get current chapter from reading progress
     try:
-        user_book = UserBook.objects.get(user_id=user_id, book=profile.book)
-        day_chapter_num = min(
-            getattr(user_book, 'current_chapter', 1) or 1,
-            total_chapters
+        schedule = ReadingSchedule.objects.get(
+            user_id=user_id, book=profile.book
         )
-    except Exception:
-        day_chapter_num = 1
+        # Find tomorrow's day entry
+        tomorrow_day = (notification_date - schedule.start_date).days + 2  # +2 for tomorrow
+        tomorrow_entries = [
+            e for e in schedule.schedule_data
+            if e.get('day') == tomorrow_day
+        ]
+        if tomorrow_entries:
+            entry = tomorrow_entries[0]
+            ai_chapter = profile.ai_chapters.filter(
+                chapter_number=entry.get('chapter_number', 1)
+            ).first()
+            # Get chunk text for tomorrow's reading
+            chunk_ids = entry.get('chunk_ids', [])
+            if chunk_ids:
+                first_chunk = Chunk.objects.filter(id=chunk_ids[0]).first()
+                if first_chunk:
+                    chapter_text = first_chunk.text
+    except ReadingSchedule.DoesNotExist:
+        pass
 
-    # Get AI chapter for this day
-    ai_chapter = profile.ai_chapters.filter(
-        chapter_number=day_chapter_num
-    ).first() or profile.ai_chapters.first()
+    # Fallback: use current reading progress
+    if not ai_chapter:
+        total_chapters = profile.ai_chapters.count()
+        if total_chapters == 0:
+            logger.warning(f'[Intelligence] No AI chapters for profile {profile_id}')
+            return
+        from apps.library.models import UserBook
+        try:
+            user_book = UserBook.objects.get(user_id=user_id, book=profile.book)
+            day_chapter_num = min(
+                getattr(user_book, 'current_chapter', 1) or 1, total_chapters
+            )
+        except Exception:
+            day_chapter_num = 1
+        ai_chapter = profile.ai_chapters.filter(
+            chapter_number=day_chapter_num
+        ).first() or profile.ai_chapters.first()
 
-    # Get chapter text
-    try:
-        existing_chapter = Chapter.objects.get(
-            book=profile.book, chapter_number=ai_chapter.chapter_number
-        )
-        chunks = Chunk.objects.filter(chapter=existing_chapter).order_by('chunk_index')[:8]
-        chapter_text = ' '.join(c.text for c in chunks)
-    except Chapter.DoesNotExist:
-        chapter_text = ai_chapter.chapter_hook
+    if not chapter_text:
+        try:
+            existing_chapter = Chapter.objects.get(
+                book=profile.book, chapter_number=ai_chapter.chapter_number
+            )
+            chunks = Chunk.objects.filter(chapter=existing_chapter).order_by('chunk_index')[:4]
+            # Respect 8k limit: take first 3,000 words only
+            raw = ' '.join(c.text for c in chunks)
+            chapter_text = ' '.join(raw.split()[:3000])
+        except Chapter.DoesNotExist:
+            chapter_text = ai_chapter.chapter_hook or ''
 
     try:
         pieces = generate_daily_notifications(
             book_title=profile.book.title,
             chapter_title=ai_chapter.title,
-            chapter_text_sample=chapter_text,
+            chapter_text_sample=' '.join(chapter_text.split()[:3000]),
             day_number=(notification_date - profile.created_at.date()).days + 1,
         )
 
@@ -361,3 +481,38 @@ def generate_daily_notifications_task(self, profile_id: str, user_id: int, targe
     except Exception as exc:
         logger.error(f'[Intelligence] Notification generation failed: {exc}', exc_info=True)
         raise self.retry(exc=exc, countdown=30)
+
+
+@shared_task(name='book_intelligence.dispatch_nightly_notifications')
+def dispatch_nightly_notifications():
+    """
+    Celery Beat nightly task (11PM) — fan out one notification job per active user/book.
+    Runs via `readify_nightly_notifications` beat schedule in config/celery.py.
+    Only dispatches for books that have an intelligence profile + reading schedule.
+    """
+    from apps.book_intelligence.models import BookIntelligenceProfile
+    from apps.books.models import ReadingSchedule
+
+    today_str = date.today().isoformat()
+    dispatched = 0
+
+    schedules = ReadingSchedule.objects.select_related(
+        'user', 'book', 'book__intelligence_profile'
+    ).all()
+
+    for schedule in schedules:
+        try:
+            profile = schedule.book.intelligence_profile
+            generate_daily_notifications_task.delay(
+                str(profile.id),
+                schedule.user.id,
+                today_str,
+            )
+            dispatched += 1
+        except Exception as exc:
+            logger.warning(
+                f'[Nightly] Could not queue notifications for '
+                f'user={schedule.user_id} book={schedule.book_id}: {exc}'
+            )
+
+    logger.info(f'[Nightly] Dispatched {dispatched} notification jobs for {today_str}')

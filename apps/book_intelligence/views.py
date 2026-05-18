@@ -51,6 +51,7 @@ from .tasks import (
     generate_chapter_intelligence_task,
     generate_daily_notifications_task,
 )
+from apps.books.tasks import task_build_reading_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -330,7 +331,7 @@ class AskYourBookView(APIView):
         relevant = find_relevant_chunks(
             profile_id=str(profile.id),
             question=question,
-            top_k=5,
+            top_k=3,
         )
 
         if not relevant:
@@ -342,11 +343,22 @@ class AskYourBookView(APIView):
         context_chunks = [r['text'] for r in relevant]
         source_pages = list({r['page_number'] for r in relevant})
 
+        # Get last 3 conversation exchanges for context
+        history = []
+        try:
+            conv = QAConversation.objects.get(user=request.user, profile=profile)
+            history = list(
+                conv.messages.order_by('-created_at')[:3].values('question', 'answer')
+            )
+        except QAConversation.DoesNotExist:
+            pass
+
         # Get grounded answer from DeepSeek
         answer = answer_question_with_context(
             book_title=book.title,
             question=question,
             context_chunks=context_chunks,
+            conversation_history=history,
         )
 
         # Save to conversation history
@@ -385,14 +397,17 @@ class QAHistoryView(APIView):
             conversation = QAConversation.objects.get(
                 user=request.user, profile=profile
             )
-            messages = conversation.messages.order_by('created_at')
+            # Get last 3 exchanges for context (per implementation guide)
+            history = conversation.messages.order_by('-created_at')[:3].values(
+                'question', 'answer'
+            )
             return Response({
                 'conversation_id': str(conversation.id),
-                'messages': QAMessageSerializer(messages, many=True).data,
+                'messages': QAMessageSerializer(conversation.messages.order_by('created_at'), many=True).data,
+                'history': list(history),
             })
         except QAConversation.DoesNotExist:
-            return Response({'conversation_id': None, 'messages': []})
-
+            return Response({'conversation_id': None, 'messages': [], 'history': []})
 
 # ── 7. Notifications ──────────────────────────────────────────────────────────
 
@@ -431,6 +446,105 @@ class TodayNotificationsView(APIView):
                 'ready': False,
                 'message': "Today's notifications are being generated. Check back in a few seconds.",
             }, status=status.HTTP_202_ACCEPTED)
+
+
+# ── 8. Confirm Chapters ───────────────────────────────────────────────────────
+
+class ConfirmChaptersView(APIView):
+    """
+    POST /api/v1/intelligence/books/<book_id>/chapters/confirm/
+
+    Called by Flutter after the user reviews the detected chapter list.
+    Accepts optional edits (renames/reorders) and triggers Stage 3:
+    task_build_reading_schedule.
+
+    Request body (all optional):
+    {
+      "chapters": [
+        {"chapter_number": 1, "title": "Optional new title"},
+        ...
+      ]
+    }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, book_id):
+        book, err = _get_book_or_404(book_id)
+        if err:
+            return err
+
+        profile, err = _get_profile_or_404(book)
+        if err:
+            return err
+
+        edits = request.data.get('chapters', [])
+
+        # Apply optional reading preference updates before building the schedule
+        reading_mode = request.data.get('reading_mode', '').strip()
+        daily_minutes = request.data.get('daily_minutes')
+        valid_modes = {'skim', 'concept', 'deep', 'exam'}
+        book_dirty = False
+        if reading_mode in valid_modes:
+            book.reading_mode = reading_mode
+            book_dirty = True
+        if daily_minutes is not None:
+            try:
+                minutes = int(daily_minutes)
+                if 5 <= minutes <= 180:
+                    book.daily_minutes = minutes
+                    book_dirty = True
+            except (ValueError, TypeError):
+                pass
+        if book_dirty:
+            book.save(update_fields=['reading_mode', 'daily_minutes'])
+
+        # Apply user title edits if provided
+        if edits:
+            for edit in edits:
+                ch_num = edit.get('chapter_number')
+                new_title = edit.get('title', '').strip()
+                if ch_num and new_title:
+                    BookIntelligenceChapter.objects.filter(
+                        profile=profile,
+                        chapter_number=ch_num,
+                    ).update(title=new_title[:255])
+
+        # Mark all chapters as confirmed
+        profile.ai_chapters.all().update(user_confirmed=True)
+
+        # Check if schedule already exists (idempotent)
+        from apps.books.models import ReadingSchedule
+        if ReadingSchedule.objects.filter(
+            user=request.user, book=book
+        ).exists():
+            return Response({
+                'message': 'Chapters already confirmed. Schedule exists.',
+                'book_id': str(book_id),
+            })
+
+        # Trigger Stage 3: build reading schedule
+        task_build_reading_schedule.delay(str(book_id), request.user.id)
+
+        # Update upload status to SCHEDULING
+        try:
+            from apps.books.models import UserUploadedBook
+            upload = book.user_upload_source
+            if upload:
+                upload.status = UserUploadedBook.Status.SCHEDULING
+                upload.processing_stage = 'building_schedule'
+                upload.save(update_fields=['status', 'processing_stage'])
+        except Exception:
+            pass
+
+        chapters_data = BookIntelligenceChapterSerializer(
+            profile.ai_chapters.all(), many=True
+        ).data
+
+        return Response({
+            'message': 'Chapters confirmed. Building your reading schedule...',
+            'book_id': str(book_id),
+            'chapters': chapters_data,
+        }, status=status.HTTP_202_ACCEPTED)
 
 
 class GenerateNotificationsView(APIView):

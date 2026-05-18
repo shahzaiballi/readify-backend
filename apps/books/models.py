@@ -51,6 +51,18 @@ class Book(models.Model):
         COMPLETED = 'completed', 'Completed'
         FAILED = 'failed', 'Failed'
 
+    class ReadingMode(models.TextChoices):
+        SKIM = 'skim', 'Skim'
+        CONCEPT = 'concept', 'Concept'
+        DEEP = 'deep', 'Deep'
+        EXAM = 'exam', 'Exam'
+
+    class ChapterSource(models.TextChoices):
+        BOOKMARKS = 'bookmarks', 'PDF Bookmarks'
+        TEXT_TOC = 'text_toc', 'Text TOC'
+        AI_GENERATED = 'ai_generated', 'AI Generated'
+        MANUAL = 'manual', 'Manual Split'
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)
     author = models.CharField(max_length=255)
@@ -113,6 +125,23 @@ class Book(models.Model):
         help_text='Show in Recommended section for all users on home screen'
     )
 
+    reading_mode = models.CharField(
+        max_length=10,
+        choices=ReadingMode.choices,
+        default=ReadingMode.DEEP,
+        help_text='User\'s chosen reading mode — drives which summaries are pre-generated',
+    )
+    daily_minutes = models.PositiveIntegerField(
+        default=30,
+        help_text='User\'s daily reading time in minutes (15/30/45/60)',
+    )
+    chapter_source = models.CharField(
+        max_length=20,
+        choices=ChapterSource.choices,
+        default=ChapterSource.MANUAL,
+        help_text='How chapters were detected for this book',
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -156,6 +185,8 @@ class Chapter(models.Model):
     duration_in_minutes = models.PositiveIntegerField(default=15)
     is_locked = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    start_page = models.PositiveIntegerField(null=True, blank=True)
+    end_page = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ['chapter_number']
@@ -167,14 +198,22 @@ class Chapter(models.Model):
 
 class Chunk(models.Model):
     """
-    A reading chunk — one screen's worth of content (~2-5 minutes).
-    Auto-created by AI processing from PDF text.
+    A reading chunk — one session's worth of content.
+    Auto-created by task_build_reading_schedule using daily_minutes-based formula.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     chapter = models.ForeignKey(Chapter, on_delete=models.CASCADE, related_name='chunks')
     chunk_index = models.PositiveIntegerField()
     text = models.TextField()
     estimated_minutes = models.PositiveIntegerField(default=2)
+    day_number = models.PositiveIntegerField(
+        default=1,
+        help_text='Which reading day this chunk belongs to (1-indexed, sequential across all chapters)',
+    )
+    words_count = models.PositiveIntegerField(
+        default=0,
+        help_text='Precomputed word count for scheduling calculations',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -218,18 +257,19 @@ class UserUploadedBook(models.Model):
     """
     Tracks a PDF that a specific user uploaded from the Flutter app.
 
-    Flow:
-    1. User uploads PDF → this record is created with status=PENDING
-    2. Celery task picks it up → extracts text → calls Claude → creates Book + chapters + chunks
-    3. Status becomes COMPLETED → UserBook record is created → appears in user's library
-    4. On home screen, user's OWN uploads are NOT shown in the global Recommended section
-
-    This is separate from Book to keep the processing queue clean.
+    New pipeline flow:
+    1. User uploads PDF (with reading_mode + daily_minutes) → PENDING
+    2. task_extract_and_detect runs → chapters detected → AWAITING_CONFIRM
+    3. User reviews chapters in Flutter → calls /chapters/confirm/ → SCHEDULING
+    4. task_build_reading_schedule runs → chunks created → PROCESSING
+    5. Book Brief + initial summaries generated → COMPLETED
     """
 
     class Status(models.TextChoices):
         PENDING = 'pending', 'Pending Processing'
         PROCESSING = 'processing', 'Processing'
+        AWAITING_CONFIRM = 'awaiting_confirm', 'Awaiting Chapter Confirmation'
+        SCHEDULING = 'scheduling', 'Building Reading Schedule'
         COMPLETED = 'completed', 'Completed'
         FAILED = 'failed', 'Failed'
 
@@ -247,6 +287,33 @@ class UserUploadedBook(models.Model):
 
     # The actual PDF file
     pdf_file = models.FileField(upload_to=user_book_pdf_upload_path, max_length=255)
+
+    # Reading preferences (collected at upload time)
+    reading_mode = models.CharField(
+        max_length=10,
+        choices=Book.ReadingMode.choices,
+        default=Book.ReadingMode.DEEP,
+    )
+    daily_minutes = models.PositiveIntegerField(default=30)
+
+    # TOC detection results (stored for review step)
+    toc_raw = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Raw detected chapters before user confirmation',
+    )
+    total_pages = models.PositiveIntegerField(
+        default=0,
+        help_text='Total PDF page count, set during Stage 1',
+    )
+
+    # Granular pipeline stage — Flutter polls this for detailed progress
+    processing_stage = models.CharField(
+        max_length=50,
+        blank=True,
+        default='',
+        help_text='Current pipeline stage name for Flutter status polling',
+    )
 
     # Processing state
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
@@ -266,3 +333,42 @@ class UserUploadedBook(models.Model):
 
     def __str__(self):
         return f"{self.uploaded_by.email}: {self.title} ({self.status})"
+
+
+class ReadingSchedule(models.Model):
+    """
+    Stores the full reading calendar for a user+book combination.
+    Created by task_build_reading_schedule after chapter confirmation.
+    One record per user per book.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='reading_schedules',
+    )
+    book = models.ForeignKey(
+        Book,
+        on_delete=models.CASCADE,
+        related_name='reading_schedules',
+    )
+
+    schedule_data = models.JSONField(
+        default=list,
+        help_text='List of {day, chunk_ids, estimated_minutes, chapter_number, chapter_title}',
+    )
+    total_days = models.PositiveIntegerField(default=0)
+    start_date = models.DateField(
+        help_text='When the user started this reading plan',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ['user', 'book']
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.user}: {self.book.title} ({self.total_days} days)"
