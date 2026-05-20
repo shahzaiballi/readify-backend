@@ -14,7 +14,7 @@ from celery import Celery
 from celery.schedules import crontab
 
 # Tell Celery which Django settings file to use
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings.development')
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings.production')
 
 app = Celery('readify')
 

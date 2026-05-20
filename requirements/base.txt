@@ -29,3 +29,13 @@ google-auth==2.32.0
 
 # Email
 # (uses Django's built-in SMTP backend)
+
+# Production server
+gunicorn==22.0.0
+
+# Static files serving (no nginx needed)
+whitenoise==6.7.0
+
+# Cloud media storage for PDFs and images
+cloudinary==1.36.0
+django-cloudinary-storage==0.3.0
