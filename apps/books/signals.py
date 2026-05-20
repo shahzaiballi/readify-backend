@@ -43,6 +43,25 @@ def trigger_book_pdf_processing(sender, instance, created, **kwargs):
         # Use .delay() to run in background via Celery
         # transaction.on_commit() ensures the DB write is committed before Celery reads it
         from django.db import transaction
-        transaction.on_commit(
-            lambda: process_admin_book_pdf.delay(str(instance.id))
-        )
+        import logging
+        _log = logging.getLogger(__name__)
+        book_id = str(instance.id)
+
+        def _dispatch_task():
+            try:
+                process_admin_book_pdf.delay(book_id)
+                _log.info(f'[Signal] Queued process_admin_book_pdf for book {book_id}')
+            except Exception as exc:
+                _log.error(
+                    f'[Signal] Could not queue Celery task for book {book_id}: {exc}. '
+                    f'Check CELERY_BROKER_URL env var and ensure Redis is reachable.',
+                    exc_info=True,
+                )
+                # Mark book as failed so the admin sees an actionable status
+                from apps.books.models import Book as _Book
+                _Book.objects.filter(id=book_id).update(
+                    processing_status=_Book.ProcessingStatus.FAILED,
+                    processing_error=f'Celery broker unreachable: {exc}',
+                )
+
+        transaction.on_commit(_dispatch_task)

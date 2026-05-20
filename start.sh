@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
+# Apply any pending database migrations (runs on every deploy — safe + idempotent)
+echo ">>> Running migrations..."
+python manage.py migrate --noinput
+
+# Collect static files
+echo ">>> Collecting static files..."
+python manage.py collectstatic --noinput --clear
+
 # Create superuser automatically if env vars are set (Render free tier has no shell)
 if [ -n "$SUPERUSER_EMAIL" ] && [ -n "$SUPERUSER_PASSWORD" ]; then
     python manage.py shell -c "

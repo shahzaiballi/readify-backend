@@ -264,7 +264,19 @@ class UserUploadSerializer(serializers.ModelSerializer):
 
         # Trigger Stage 1: Extract + Detect (not old process_user_uploaded_book)
         from apps.books.tasks import task_extract_and_detect
-        task_extract_and_detect.delay(str(upload.id))
+        import logging
+        _log = logging.getLogger(__name__)
+        try:
+            task_extract_and_detect.delay(str(upload.id))
+        except Exception as exc:
+            _log.error(
+                f'[Upload] Could not queue task for upload {upload.id}: {exc}. '
+                f'Check CELERY_BROKER_URL env var and ensure Redis is reachable.',
+                exc_info=True,
+            )
+            upload.status = UserUploadedBook.Status.FAILED
+            upload.error_message = f'Celery broker unreachable — could not start processing: {exc}'
+            upload.save(update_fields=['status', 'error_message'])
 
         return upload
 
