@@ -150,6 +150,8 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_USE_SSL = {'ssl_cert_reqs': None} if CELERY_BROKER_URL.startswith('rediss://') else None
 
 # ── DeepSeek API (primary AI — replaces Claude) ──────────────────────────────
 # Get your key at https://platform.deepseek.com

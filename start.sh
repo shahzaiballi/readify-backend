@@ -22,6 +22,14 @@ else:
 "
 fi
 
+# Seed demo data if SEED_DEMO=true env var is set (Render free tier has no shell)
+# WARNING: seed_demo wipes all data — remove this env var after first successful seed
+if [ "$SEED_DEMO" = "true" ]; then
+    echo ">>> SEED_DEMO=true detected — running seed_demo (this wipes existing data)..."
+    python manage.py seed_demo
+    echo ">>> Seed complete. Remove SEED_DEMO env var on Render to prevent re-seeding on next deploy."
+fi
+
 # Run Celery worker + beat combined in background
 celery -A config worker \
     --beat \

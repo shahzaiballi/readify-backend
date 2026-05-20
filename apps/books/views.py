@@ -571,25 +571,28 @@ class TodayCompleteView(APIView):
         )
         todays_chunks = all_chunks[start_idx:end_idx]
 
-        # Idempotency guard (B8 fix): prevent double-submission advancing current_day twice
-        from apps.library.models import UserBook as _UB
-        _ub_check = _UB.objects.filter(user=request.user, book=book).first()
-        if _ub_check and ReadingSession.objects.filter(
-            user_book=_ub_check, session_date=date.today()
-        ).filter(
-            last_chunk__in=[c for c in todays_chunks]
-        ).exists():
-            return Response({
-                'progressPercent': _ub_check.progress_percent,
-                'pagesReadToday': pages_read_today,
-                'totalPagesRead': end_idx,
-                'totalPages': total_chunks,
-                'nextDayNumber': schedule.current_day,
-                'totalDays': schedule.total_days,
-                'daysRemaining': max(0, schedule.total_days - (schedule.current_day - 1)),
-                'milestone': None,
-                'isBookComplete': schedule.current_day > schedule.total_days,
-            })
+        # Idempotency guard: compare day_number sent by client against schedule.current_day.
+        # If the client sends day_number and it doesn't match the current schedule day,
+        # the request is stale (already advanced) — return without double-advancing.
+        day_number_from_client = request.data.get('day_number')
+        if day_number_from_client is not None:
+            try:
+                if int(day_number_from_client) != completed_day:
+                    from apps.library.models import UserBook as _UB2
+                    _ub2 = _UB2.objects.filter(user=request.user, book=book).first()
+                    return Response({
+                        'progressPercent': _ub2.progress_percent if _ub2 else 0,
+                        'pagesReadToday': pages_read_today,
+                        'totalPagesRead': end_idx,
+                        'totalPages': total_chunks,
+                        'nextDayNumber': schedule.current_day,
+                        'totalDays': schedule.total_days,
+                        'daysRemaining': max(0, schedule.total_days - (schedule.current_day - 1)),
+                        'milestone': None,
+                        'isBookComplete': schedule.current_day > schedule.total_days,
+                    })
+            except (ValueError, TypeError):
+                pass
 
         # Advance schedule
         schedule.current_day += 1
