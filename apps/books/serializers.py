@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from django.db.models import Sum
 from .models import Book, Chapter, Chunk, Summary, Flashcard, UserUploadedBook, ReadingSchedule
 from django.contrib.auth.models import AnonymousUser
 
@@ -42,10 +43,11 @@ class BookDetailSerializer(serializers.ModelSerializer):
     readersCount = serializers.SerializerMethodField()
     imageUrl = serializers.SerializerMethodField()
     hasAudio = serializers.BooleanField(source='has_audio')
-    totalChapters = serializers.IntegerField(source='total_chapters')
-    pagesLeft = serializers.IntegerField(source='pages_left')
-    flashcardsCount = serializers.IntegerField(source='flashcards_count')
+    totalChapters = serializers.SerializerMethodField()
+    pagesLeft = serializers.SerializerMethodField()
+    flashcardsCount = serializers.SerializerMethodField()
     readPerDayMinutes = serializers.IntegerField(source='read_per_day_minutes')
+    readPerDayPages = serializers.SerializerMethodField()
     progressPercent = serializers.SerializerMethodField()
     daysLeftToFinish = serializers.SerializerMethodField()
 
@@ -57,7 +59,7 @@ class BookDetailSerializer(serializers.ModelSerializer):
             'hasAudio', 'badge', 'description',
             'totalChapters', 'progressPercent',
             'daysLeftToFinish', 'pagesLeft',
-            'flashcardsCount', 'readPerDayMinutes',
+            'flashcardsCount', 'readPerDayMinutes', 'readPerDayPages',
         ]
 
     def get_readersCount(self, obj):
@@ -70,6 +72,16 @@ class BookDetailSerializer(serializers.ModelSerializer):
             return request.build_absolute_uri(url)
         return url or ''
 
+    def get_totalChapters(self, obj):
+        count = obj.chapters.count()
+        return count if count > 0 else (obj.total_chapters or 0)
+
+    def get_flashcardsCount(self, obj):
+        try:
+            return obj.flashcards.count()
+        except Exception:
+            return obj.flashcards_count or 0
+
     def get_progressPercent(self, obj):
         request = self.context.get('request')
         if not request or not request.user.is_authenticated:
@@ -77,19 +89,57 @@ class BookDetailSerializer(serializers.ModelSerializer):
         user_book = obj.user_books.filter(user=request.user).first()
         return user_book.progress_percent if user_book else 0
 
+    def get_pagesLeft(self, obj):
+        from apps.books.models import Chunk
+        request = self.context.get('request')
+        user_book = obj.user_books.filter(user=request.user).first() if request else None
+        progress = user_book.progress_percent if user_book else 0
+
+        total_words = Chunk.objects.filter(chapter__book=obj).aggregate(
+            total=Sum('words_count')
+        )['total'] or 0
+
+        if total_words == 0:
+            total_words = obj.pages_left * 250 or 0
+
+        remaining_words = int(total_words * (1 - progress / 100))
+        return max(0, round(remaining_words / 250))
+
+    def get_readPerDayPages(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return 10
+        try:
+            from apps.reading.models import ReadingPlan
+            plan = request.user.reading_plan
+            return plan.pages_per_day if plan else 10
+        except Exception:
+            return 10
+
     def get_daysLeftToFinish(self, obj):
+        from apps.books.models import ReadingSchedule
         request = self.context.get('request')
         if not request or not request.user.is_authenticated:
             return 0
+        try:
+            schedule = ReadingSchedule.objects.get(user=request.user, book=obj)
+            remaining = schedule.total_days - (schedule.current_day - 1)
+            return max(0, remaining)
+        except ReadingSchedule.DoesNotExist:
+            pass
         user_book = obj.user_books.filter(user=request.user).first()
         if not user_book:
             return 0
         reading_plan = getattr(request.user, 'reading_plan', None)
-        daily_minutes = reading_plan.daily_minutes if reading_plan else 45
-        pages_remaining = obj.pages_left * (1 - user_book.progress_percent / 100)
-        if daily_minutes <= 0:
+        daily_minutes = reading_plan.daily_minutes if reading_plan else 30
+        total_words = Chunk.objects.filter(chapter__book=obj).aggregate(
+            total=Sum('words_count')
+        )['total'] or 0
+        words_remaining = int(total_words * (1 - user_book.progress_percent / 100))
+        words_per_day = daily_minutes * 200
+        if words_per_day <= 0:
             return 0
-        return max(1, round(pages_remaining / daily_minutes))
+        return max(1, round(words_remaining / words_per_day))
 
 
 class ChapterSerializer(serializers.ModelSerializer):

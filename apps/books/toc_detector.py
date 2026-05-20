@@ -17,6 +17,67 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# ── Front/Back Matter Blocklist ───────────────────────────────────────────────
+
+# Titles that match these patterns are NOT reading chapters.
+# Used to filter Path A (bookmarks) and Path B (text TOC) results.
+_FRONT_BACK_MATTER = re.compile(
+    r'''
+    ^\s*(
+        table\s+of\s+contents?     |
+        contents?                  |
+        list\s+of\s+(figures?|tables?|illustrations?|maps?) |
+        about\s+the\s+authors?     |
+        about\s+this\s+book        |
+        acknowledgem?ents?         |
+        preface                    |
+        foreword                   |
+        introduction\s*$           |
+        notes?\s+on\s+             |
+        author.?s?\s+note          |
+        index                      |
+        indices                    |
+        bibliography               |
+        references?\s*$            |
+        works\s+cited              |
+        further\s+reading          |
+        recommended\s+reading      |
+        appendix                   |
+        appendices                 |
+        glossary                   |
+        copyright                  |
+        dedication                 |
+        epigraph                   |
+        permissions?               |
+        credits?\s*$               |
+        colophon                   |
+        back\s+matter              |
+        front\s+matter
+    )\s*$
+    ''',
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_front_back_matter(title: str) -> bool:
+    """Return True if the title looks like front/back matter rather than a real chapter."""
+    return bool(_FRONT_BACK_MATTER.match(title.strip()))
+
+
+def _filter_chapters(chapters: list[dict]) -> list[dict]:
+    """
+    Remove front/back matter entries from a detected chapter list.
+    Keeps the chapter_number ordering intact (re-numbers after filtering).
+    """
+    filtered = [ch for ch in chapters if not _is_front_back_matter(ch.get('title', ''))]
+    # Re-number so chapter_number stays contiguous
+    for i, ch in enumerate(filtered):
+        ch = dict(ch)
+        ch['chapter_number'] = i + 1
+        filtered[i] = ch
+    return filtered
+
+
 # ── Path A: PDF Bookmarks ─────────────────────────────────────────────────────
 
 def detect_from_bookmarks(pdf_path: str) -> list[dict]:
@@ -68,6 +129,11 @@ def detect_from_bookmarks(pdf_path: str) -> list[dict]:
             'end_page': end_page,
             'page_range_display': f'Pages {start_page}–{end_page}',
         })
+
+    before = len(chapters)
+    chapters = _filter_chapters(chapters)
+    if before != len(chapters):
+        logger.info(f'[TOC-A] Filtered {before - len(chapters)} front/back matter entries')
 
     logger.info(f'[TOC-A] {len(chapters)} chapters from PDF bookmarks')
     return chapters
@@ -143,6 +209,11 @@ def detect_from_text(pages: list[dict], total_pages: int) -> list[dict]:
             'page_range_display': f"Pages {c['page']}–{end_page}",
         })
 
+    before = len(chapters)
+    chapters = _filter_chapters(chapters)
+    if before != len(chapters):
+        logger.info(f'[TOC-B] Filtered {before - len(chapters)} front/back matter entries')
+
     logger.info(f'[TOC-B] {len(chapters)} chapters from text TOC regex')
     return chapters
 
@@ -188,6 +259,9 @@ def validate_chapter_structure(chapters: list[dict], total_pages: int) -> bool:
         )
         return False
 
+    # Minimum pages per chapter — anything shorter is likely front/back matter
+    MIN_CHAPTER_PAGES = 4
+
     for i, ch in enumerate(chapters):
         sp = ch.get('start_page', 0)
         ep = ch.get('end_page', 0)
@@ -197,6 +271,12 @@ def validate_chapter_structure(chapters: list[dict], total_pages: int) -> bool:
             return False
         if total_pages > 0 and ep > int(total_pages * 1.3) + 5:
             logger.warning(f'[TOC] ch{i + 1} end_page {ep} > total_pages {total_pages}')
+            return False
+        if (ep - sp + 1) < MIN_CHAPTER_PAGES:
+            logger.warning(
+                f'[TOC] ch{i + 1} "{ch.get("title", "?")}" only {ep - sp + 1} pages '
+                f'— likely front/back matter, rejecting entire set'
+            )
             return False
 
     return True

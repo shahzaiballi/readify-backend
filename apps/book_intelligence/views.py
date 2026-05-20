@@ -481,22 +481,22 @@ class ConfirmChaptersView(APIView):
 
         # Apply optional reading preference updates before building the schedule
         reading_mode = request.data.get('reading_mode', '').strip()
-        daily_minutes = request.data.get('daily_minutes')
+        daily_minutes = request.data.get('daily_minutes') or request.data.get('pages_per_day')
         valid_modes = {'skim', 'concept', 'deep', 'exam'}
-        book_dirty = False
+        book_dirty_fields = []
         if reading_mode in valid_modes:
             book.reading_mode = reading_mode
-            book_dirty = True
+            book_dirty_fields.append('reading_mode')
         if daily_minutes is not None:
             try:
-                minutes = int(daily_minutes)
-                if 5 <= minutes <= 180:
-                    book.daily_minutes = minutes
-                    book_dirty = True
+                mins = int(daily_minutes)
+                if 1 <= mins <= 480:
+                    book.daily_minutes = mins
+                    book_dirty_fields.append('daily_minutes')
             except (ValueError, TypeError):
                 pass
-        if book_dirty:
-            book.save(update_fields=['reading_mode', 'daily_minutes'])
+        if book_dirty_fields:
+            book.save(update_fields=book_dirty_fields)
 
         # Apply user title edits if provided
         if edits:

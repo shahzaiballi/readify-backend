@@ -7,13 +7,13 @@ class ReadingPlanSerializer(serializers.ModelSerializer):
     Matches your ReadingPlanEntity.
     Used by ReadingPlanPage and readingPlanProvider.
     """
-    dailyMinutes = serializers.IntegerField(source='daily_minutes')
+    pagesPerDay = serializers.IntegerField(source='pages_per_day')
     daysPerWeek = serializers.IntegerField(source='days_per_week')
     preferredTime = serializers.CharField(source='preferred_time')
 
     class Meta:
         model = ReadingPlan
-        fields = ['dailyMinutes', 'daysPerWeek', 'preferredTime']
+        fields = ['pagesPerDay', 'daysPerWeek', 'preferredTime']
 
 
 class ReadingSessionSerializer(serializers.ModelSerializer):
@@ -47,8 +47,8 @@ class CreateSessionSerializer(serializers.Serializer):
 class InsightsSerializer(serializers.Serializer):
     """
     Matches your InsightsEntity exactly.
-    cardsDue, readTodayMinutes, dayStreak
+    cardsDue, readTodayPages, dayStreak
     """
     cardsDue = serializers.IntegerField()
-    readTodayMinutes = serializers.IntegerField()
+    readTodayPages = serializers.IntegerField()
     dayStreak = serializers.IntegerField()

@@ -124,9 +124,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
     name = serializers.CharField(source='full_name', read_only=True)
     avatarUrl = serializers.SerializerMethodField()
 
-    booksRead = serializers.IntegerField(source='books_read', read_only=True)
-    totalPages = serializers.IntegerField(source='total_pages_read', read_only=True)
-    currentStreak = serializers.IntegerField(source='current_streak', read_only=True)
+    booksRead = serializers.SerializerMethodField()
+    totalPages = serializers.SerializerMethodField()
+    currentStreak = serializers.SerializerMethodField()
     isAvidReader = serializers.BooleanField(source='is_avid_reader', read_only=True)
 
     achievements = serializers.SerializerMethodField()
@@ -147,28 +147,62 @@ class UserProfileSerializer(serializers.ModelSerializer):
             return obj.avatar.url
         return f'https://i.pravatar.cc/150?u={obj.email}'
 
+    def get_booksRead(self, user):
+        from apps.library.models import UserBook
+        return UserBook.objects.filter(user=user, status=UserBook.Status.COMPLETED).count()
+
+    def get_totalPages(self, user):
+        from apps.reading.models import ReadingSession
+        from django.db.models import Sum
+        result = ReadingSession.objects.filter(
+            user_book__user=user
+        ).aggregate(total=Sum('chunks_completed'))['total']
+        return result or 0
+
+    def get_currentStreak(self, user):
+        from apps.reading.models import ReadingSession
+        from datetime import date, timedelta
+        today = date.today()
+        streak = 0
+        has_today = ReadingSession.objects.filter(
+            user_book__user=user, session_date=today
+        ).exists()
+        check_date = today if has_today else today - timedelta(days=1)
+        while True:
+            if ReadingSession.objects.filter(
+                user_book__user=user, session_date=check_date
+            ).exists():
+                streak += 1
+                check_date -= timedelta(days=1)
+            else:
+                break
+        return streak
+
     def get_achievements(self, user):
+        books_read = self.get_booksRead(user)
+        streak = self.get_currentStreak(user)
+        total_pages = self.get_totalPages(user)
         return [
             {
                 'id': 'a1',
                 'title': 'First Week Streak',
                 'description': 'Read for 7 consecutive days',
                 'iconCode': 'trophy',
-                'isUnlocked': user.current_streak >= 7,
+                'isUnlocked': streak >= 7,
             },
             {
                 'id': 'a2',
                 'title': 'Bookworm',
                 'description': 'Completed 10 books',
                 'iconCode': 'books',
-                'isUnlocked': user.books_read >= 10,
+                'isUnlocked': books_read >= 10,
             },
             {
                 'id': 'a3',
                 'title': 'Consistent Reader',
                 'description': 'Met daily goal 30 times',
                 'iconCode': 'target',
-                'isUnlocked': user.total_pages_read >= 1000,
+                'isUnlocked': total_pages >= 1000,
             },
         ]
 

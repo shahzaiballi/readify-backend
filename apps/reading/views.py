@@ -168,17 +168,21 @@ class InsightsView(APIView):
             book_id__in=in_progress_book_ids
         ).count()
 
-        # 2. Read today — sum of all session durations today
+        # 2. Read today — sum of pages (chunks) completed in all sessions today
         today_sessions = ReadingSession.objects.filter(
             user_book__user=user,
             session_date=today
         )
-        read_today_seconds = sum(s.duration_seconds for s in today_sessions)
-        read_today_minutes = round(read_today_seconds / 60)
+        read_today_pages = sum(s.chunks_completed for s in today_sessions)
 
-        # 3. Day streak — count consecutive days with at least one session
+        # 3. Day streak — count consecutive days with at least one session.
+        # Start from today if read today, otherwise from yesterday (preserve streak
+        # for users who haven't read yet today but have an active streak).
         streak = 0
-        check_date = today
+        has_session_today = ReadingSession.objects.filter(
+            user_book__user=user, session_date=today
+        ).exists()
+        check_date = today if has_session_today else today - timedelta(days=1)
         while True:
             has_session = ReadingSession.objects.filter(
                 user_book__user=user,
@@ -192,7 +196,7 @@ class InsightsView(APIView):
 
         serializer = InsightsSerializer({
             'cardsDue': cards_due,
-            'readTodayMinutes': read_today_minutes,
+            'readTodayPages': read_today_pages,
             'dayStreak': streak,
         })
 
@@ -211,7 +215,7 @@ class ReadingPlanView(APIView):
         plan, _ = ReadingPlan.objects.get_or_create(
             user=request.user,
             defaults={
-                'daily_minutes': 45,
+                'pages_per_day': 10,
                 'days_per_week': 5,
                 'preferred_time': 'Evening',
             }
@@ -224,9 +228,8 @@ class ReadingPlanView(APIView):
         serializer = ReadingPlanSerializer(plan, data=request.data)
 
         if serializer.is_valid():
-            # Map camelCase back to snake_case for saving
-            plan.daily_minutes = serializer.validated_data.get(
-                'daily_minutes', plan.daily_minutes
+            plan.pages_per_day = serializer.validated_data.get(
+                'pages_per_day', plan.pages_per_day
             )
             plan.days_per_week = serializer.validated_data.get(
                 'days_per_week', plan.days_per_week

@@ -108,8 +108,15 @@ Identify chapter boundaries from headings, "Chapter N" patterns, or major topic 
 Rules:
 - end_page of chapter N = start_page of chapter N+1 minus 1.
 - end_page of the last chapter = {total_pages}.
-- Skip front matter (copyright, dedication, TOC).
-- Return [] if you cannot confidently identify chapters.
+- EXCLUDE all of the following — these are NOT chapters:
+    Table of Contents, Contents, Preface, Foreword, Introduction (standalone),
+    Acknowledgements, About the Author, About the Authors, About This Book,
+    Author's Note, Index, Bibliography, References, Works Cited,
+    Further Reading, Recommended Reading, Appendix, Appendices,
+    Glossary, Copyright, Dedication, Permissions, Epigraph, Notes.
+- Only include sections that contain the book's actual substantive content.
+- A real chapter must span at least 4 pages.
+- Return [] if you cannot confidently identify at least 2 real chapters.
 
 Return ONLY a valid JSON array, no markdown:
 [
@@ -245,6 +252,8 @@ def generate_chapter_summary_for_mode(
     chapter_text: str,
     mode: str,
     book_title: str,
+    book_type: str = 'other',
+    complexity_level: str = 'intermediate',
 ) -> dict:
     """
     Generate chapter content for a specific reading mode.
@@ -256,63 +265,126 @@ def generate_chapter_summary_for_mode(
     """
     preview = _words_to_chars(chapter_text, max_words=6000)
 
+    # Build a calibration line so the AI adjusts tone to the book's nature
+    _complexity_map = {
+        'beginner': 'Use plain, accessible language. Avoid jargon.',
+        'intermediate': 'Use clear language. Define specialist terms briefly.',
+        'advanced': 'Use precise technical language appropriate for an expert audience.',
+    }
+    _type_map = {
+        'self_help': 'Focus on actionable insights and practical takeaways.',
+        'business': 'Focus on strategies, frameworks, and business implications.',
+        'academic': 'Focus on arguments, evidence, methodology, and conclusions.',
+        'technical': 'Focus on concepts, mechanisms, and how things work.',
+        'biography': 'Focus on events, decisions, character, and lessons drawn.',
+        'fiction': 'Focus on narrative arc, character development, themes, and tone.',
+        'other': 'Focus on the key ideas and main arguments.',
+    }
+    calibration = (
+        f'Book context: This is a {complexity_level} {book_type} book. '
+        f'{_complexity_map.get(complexity_level, "")} '
+        f'{_type_map.get(book_type, "")}'
+    )
+
     mode_prompts = {
         'skim': f"""Chapter: "{chapter_title}" from "{book_title}"
+{calibration}
 
-Text sample:
+Text:
 {preview}
 
-Skim Mode: Give ONE punchy sentence capturing the entire chapter's essence.
+Skim Mode: Write ONE powerful sentence (15-25 words) that captures this chapter's single most important idea. It must be specific to this chapter's actual content — not generic.
 Return ONLY valid JSON:
-{{"one_liner": "The single most important takeaway from this chapter in one powerful sentence"}}""",
+{{"one_liner": "Your specific, punchy one-sentence takeaway here"}}""",
 
         'concept': f"""Chapter: "{chapter_title}" from "{book_title}"
+{calibration}
 
-Text sample:
+Text:
 {preview}
 
-Concept Mode: Extract named ideas, frameworks, and mental models.
+Concept Mode: Extract every distinct named idea, framework, model, or principle from this chapter. Include at least 3 concepts, up to 8.
+For each concept:
+- Use the exact name/term as it appears in the text
+- Explain it in 2-3 sentences grounded in what the text actually says
 Return ONLY valid JSON:
 {{"concepts": [
-  {{"name": "Concept Name", "description": "2-3 sentence explanation of this idea"}},
-  {{"name": "Another Concept", "description": "What it means and why it matters"}}
+  {{"name": "Exact Concept Name", "description": "2-3 sentence explanation grounded in the chapter text"}}
 ]}}""",
 
         'deep': f"""Chapter: "{chapter_title}" from "{book_title}"
+{calibration}
 
-Text sample:
+Text:
 {preview}
 
-Deep Mode: Full comprehension breakdown with examples and narrative flow.
+Deep Mode: Produce a full comprehension breakdown. Be specific — reference actual content, examples, and ideas from the text. Do not be generic.
 Return ONLY valid JSON:
 {{
-  "overview": "3-4 sentence overview of the chapter",
-  "key_points": ["Point 1", "Point 2", "Point 3"],
-  "examples": ["Example or story from the chapter", "Another example"],
-  "analogy": "An analogy that makes the core idea memorable",
-  "why_it_matters": "Why this chapter's content is important"
+  "overview": "4-5 sentences summarising what this chapter covers and its main argument",
+  "key_points": [
+    "Specific point 1 from the chapter (not generic)",
+    "Specific point 2 from the chapter",
+    "Specific point 3 from the chapter",
+    "Specific point 4 from the chapter",
+    "Specific point 5 from the chapter"
+  ],
+  "examples": [
+    "A concrete example, story, or case study from this chapter",
+    "Another example or illustration from this chapter"
+  ],
+  "analogy": "A memorable analogy or metaphor that makes the core idea stick",
+  "why_it_matters": "2-3 sentences on why this chapter matters for the reader"
 }}""",
 
         'exam': f"""Chapter: "{chapter_title}" from "{book_title}"
+{calibration}
 
-Text sample:
+Text:
 {preview}
 
-Exam Mode: Create study-ready Q&A pairs for this chapter.
+Exam Mode: Create 5 high-quality Q&A pairs for this chapter.
+Requirements:
+- Questions must test genuine understanding, not just recall of names/dates
+- Answers must be complete and self-contained (2-4 sentences each)
+- Cover different aspects of the chapter (don't repeat the same idea)
+- Base every question and answer strictly on the provided text
 Return ONLY valid JSON:
 {{"qa_pairs": [
-  {{"question": "A conceptual question testing understanding", "answer": "A clear, complete answer"}},
-  {{"question": "Another question", "answer": "Another answer"}},
-  {{"question": "Third question", "answer": "Third answer"}},
-  {{"question": "Fourth question", "answer": "Fourth answer"}},
-  {{"question": "Fifth question", "answer": "Fifth answer"}}
+  {{"question": "Conceptual question testing understanding", "answer": "Complete, self-contained answer in 2-4 sentences"}},
+  {{"question": "Second question on a different aspect", "answer": "Complete answer"}},
+  {{"question": "Third question", "answer": "Complete answer"}},
+  {{"question": "Fourth question", "answer": "Complete answer"}},
+  {{"question": "Fifth question", "answer": "Complete answer"}}
+]}}""",
+
+        'flashcard': f"""Chapter: "{chapter_title}" from "{book_title}"
+{calibration}
+
+Text:
+{preview}
+
+Flashcard Mode: Create 8 flashcards for studying this chapter.
+Each flashcard has:
+- front: a key term, concept name, or short phrase (max 8 words) — NOT a full question
+- back: a clear, self-contained explanation of that term/concept (2-4 sentences)
+Requirements:
+- Use the exact terminology from the text on the front
+- The back must fully explain the concept without needing the front for context
+- Cover the 8 most important concepts in the chapter
+- Do not repeat concepts
+Return ONLY valid JSON:
+{{"flashcards": [
+  {{"front": "Key term or concept", "back": "Clear 2-4 sentence explanation of what it is and why it matters"}},
+  {{"front": "Another key concept", "back": "Explanation"}}
 ]}}""",
     }
 
     prompt = mode_prompts.get(mode, mode_prompts['skim'])
+    max_tokens_by_mode = {'skim': 128, 'concept': 1500, 'deep': 2500, 'exam': 2000, 'flashcard': 2000}
 
     try:
-        raw = call_deepseek(prompt, max_tokens=1500, temperature=0.3)
+        raw = call_deepseek(prompt, max_tokens=max_tokens_by_mode.get(mode, 1500), temperature=0.3)
         return _parse_json_response(raw)
     except Exception as e:
         logger.warning(f'[DeepSeek] generate_chapter_summary_for_mode ({mode}) failed: {e}')
@@ -321,6 +393,7 @@ Return ONLY valid JSON:
             'concept': {'concepts': [{'name': chapter_title, 'description': 'See chapter text.'}]},
             'deep': {'overview': f'Content from {chapter_title}.', 'key_points': [], 'examples': [], 'analogy': '', 'why_it_matters': ''},
             'exam': {'qa_pairs': [{'question': f'What is the main theme of {chapter_title}?', 'answer': 'See the chapter summary for details.'}]},
+            'flashcard': {'flashcards': [{'front': chapter_title, 'back': 'See chapter text for details.'}]},
         }
         return fallbacks.get(mode, {})
 
@@ -364,6 +437,90 @@ Return ONLY valid JSON, no markdown:
             'afternoon_story': f"A thought from your reading today in {book_title}.",
             'evening_recap': f"You engaged with {chapter_title} today. Great progress!",
         }
+
+
+def validate_and_rename_chapters(
+    book_title: str,
+    chapter_openings: list[dict],
+) -> list[dict]:
+    """
+    Fix 4 — AI Chapter Validation Pass.
+    Validates detected chapters (removes non-content entries) and renames generic titles.
+    Sends first 100 words of each chapter — max ~2,000 words total, well within 8k limit.
+    chapter_openings: list of {chapter_number, title, opening_text}
+    Returns: list of {chapter_number, is_valid, suggested_title}
+    """
+    if not chapter_openings:
+        return []
+
+    chapters_block = '\n\n'.join(
+        f'Chapter {ch["chapter_number"]} (Title: "{ch["title"]}"):\n{ch["opening_text"][:400]}'
+        for ch in chapter_openings[:20]
+    )
+
+    prompt = f"""You are reviewing auto-detected chapters in "{book_title}".
+
+For each chapter listed, decide:
+1. is_valid: true if this is genuine reading content, false if it is front/back matter
+   (Table of Contents, Preface, Foreword, About the Author, Acknowledgements,
+    Index, Bibliography, References, Appendix, Copyright, Dedication, Glossary, Notes).
+2. suggested_title: if the current title is generic (e.g. "Chapter 1", "Part II", "Section 3")
+   AND the opening text lets you infer a real descriptive title, provide one (5-10 words).
+   Otherwise return null.
+
+Chapters to review:
+{chapters_block}
+
+Return ONLY a valid JSON array — one object per chapter, same order:
+[
+  {{"chapter_number": 1, "is_valid": true, "suggested_title": "The Science of Habit Formation"}},
+  {{"chapter_number": 2, "is_valid": false, "suggested_title": null}}
+]"""
+
+    try:
+        raw = call_deepseek(prompt, max_tokens=1024, temperature=0.1)
+        result = _parse_json_response(raw)
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception as e:
+        logger.warning(f'[DeepSeek] validate_and_rename_chapters failed: {e}')
+        return []
+
+
+def clean_chunk_text(chunk_text: str) -> str:
+    """
+    Fix 5 — Chunk Text Cleaning.
+    Removes OCR artifacts and PDF extraction noise from a reading chunk.
+    Input: raw chunk text (~250-3,000 words). Returns cleaned text.
+    Falls back to original text on any failure.
+    """
+    if not chunk_text or not chunk_text.strip():
+        return chunk_text
+
+    word_count = len(chunk_text.split())
+    if word_count > 6000:
+        return chunk_text
+
+    prompt = f"""Clean the following raw text extracted from a PDF book.
+
+Fix ONLY these issues:
+1. Remove repeated headers or footers (page numbers, book title, or author name repeating at the top or bottom of pages)
+2. Fix words hyphenated across line breaks (e.g. "knowl-\\nedge" → "knowledge")
+3. Remove lines that contain only a page number (e.g. a line with just "47")
+4. Fix excessive blank lines while preserving natural paragraph breaks
+5. Do NOT alter the actual content, meaning, wording, or structure in any other way
+
+Raw text:
+{chunk_text}
+
+Return ONLY the cleaned text. No explanation, no JSON, no markdown."""
+
+    try:
+        return call_deepseek(prompt, max_tokens=min(2048, word_count * 2), temperature=0.0)
+    except Exception as e:
+        logger.warning(f'[DeepSeek] clean_chunk_text failed: {e}')
+        return chunk_text
 
 
 def answer_question_with_context(

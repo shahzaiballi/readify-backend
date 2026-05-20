@@ -6,7 +6,7 @@ from django.conf import settings
 class ReadingSession(models.Model):
     """
     Records each time a user reads.
-    Used to calculate dayStreak and readTodayMinutes for InsightsEntity.
+    Used to calculate dayStreak and readTodayPages for InsightsEntity.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -46,7 +46,7 @@ class ReadingPlan(models.Model):
         on_delete=models.CASCADE,
         related_name='reading_plan'
     )
-    daily_minutes = models.PositiveIntegerField(default=45)
+    pages_per_day = models.PositiveIntegerField(default=10)
     days_per_week = models.PositiveIntegerField(default=5)
     preferred_time = models.CharField(max_length=20, default='Evening')
 

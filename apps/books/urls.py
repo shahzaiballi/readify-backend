@@ -19,6 +19,9 @@ urlpatterns = [
     path('<uuid:book_id>/summaries/', views.BookSummariesView.as_view(), name='book-summaries'),
     path('<uuid:book_id>/flashcards/', views.BookFlashcardsView.as_view(), name='book-flashcards'),
     path('<uuid:book_id>/schedule/', views.ReadingScheduleView.as_view(), name='reading-schedule'),
+    path('<uuid:book_id>/today/', views.TodayReadingView.as_view(), name='today-reading'),
+    path('<uuid:book_id>/today/complete/', views.TodayCompleteView.as_view(), name='today-complete'),
+    path('<uuid:book_id>/today/summary/', views.TodaySummaryView.as_view(), name='today-summary'),
 
     # ── Chunks (nested under book + chapter for RESTful consistency) ──────────
     # Flutter calls: GET /api/v1/books/{book_id}/chapters/{chapter_id}/chunks/

@@ -181,6 +181,81 @@ def _merge_small_chunks(chunks: list[str], min_words: int = 100) -> list[str]:
 
 # ── Private Helpers ───────────────────────────────────────────────────────────
 
+def _apply_ai_chapter_validation(chapters: list[dict], pages: list[dict], book_title: str) -> list[dict]:
+    """
+    Fix 4 — AI Chapter Validation Pass.
+    After deterministic detection, sends first 100 words of each chapter to AI to:
+    1. Confirm the chapter is genuine reading content (not TOC/preface/about-author/index)
+    2. Replace generic titles ("Chapter 1") with descriptive ones inferred from the text
+    Only runs for non-manual detection (bookmarks / text_toc / ai_generated).
+    Falls back to original chapters on any failure — never crashes the pipeline.
+    """
+    if not chapters or not pages:
+        return chapters
+
+    pages_dict = {p['page_number']: p['text'] for p in pages}
+
+    chapter_openings = []
+    for ch in chapters:
+        text_parts = []
+        for pn in range(ch['start_page'], min(ch['start_page'] + 3, ch['end_page'] + 1)):
+            if pn in pages_dict:
+                text_parts.append(pages_dict[pn])
+        raw_text = ' '.join(text_parts)
+        opening = ' '.join(raw_text.split()[:100])
+        chapter_openings.append({
+            'chapter_number': ch['chapter_number'],
+            'title': ch['title'],
+            'opening_text': opening,
+        })
+
+    try:
+        from apps.book_intelligence.ai_client import validate_and_rename_chapters
+        validation_results = validate_and_rename_chapters(book_title, chapter_openings)
+    except Exception as exc:
+        logger.warning(f'[ChapterValidation] AI call failed: {exc} — keeping original chapters')
+        return chapters
+
+    if not validation_results:
+        return chapters
+
+    val_map = {v['chapter_number']: v for v in validation_results}
+    refined = []
+    for ch in chapters:
+        val = val_map.get(ch['chapter_number'])
+        if val is None:
+            refined.append(ch)
+            continue
+        if not val.get('is_valid', True):
+            logger.info(f'[ChapterValidation] Rejected "{ch["title"]}" as non-content')
+            continue
+        suggested = (val.get('suggested_title') or '').strip()
+        if suggested and len(suggested) > 5:
+            is_generic = bool(re.match(r'^(chapter|part|section)\s+\w+$', ch['title'], re.IGNORECASE))
+            if is_generic:
+                ch = dict(ch)
+                logger.info(f'[ChapterValidation] Renamed "{ch["title"]}" → "{suggested}"')
+                ch['title'] = suggested
+        refined.append(ch)
+
+    # Re-number contiguously after removals
+    for i, ch in enumerate(refined):
+        ch = dict(ch)
+        ch['chapter_number'] = i + 1
+        refined[i] = ch
+
+    logger.info(
+        f'[ChapterValidation] {len(chapters)} → {len(refined)} chapters after AI validation'
+    )
+
+    # Safety: if validation wiped everything out, fall back to original
+    if len(refined) < 2:
+        logger.warning('[ChapterValidation] Too few chapters after validation — reverting to pre-validation list')
+        return chapters
+
+    return refined
+
+
 def _mark_upload_failed(upload, book, error_message: str, stage: str = 'failed'):
     """Set both upload and book to FAILED status with detailed stage info."""
     try:
@@ -323,6 +398,17 @@ def task_extract_and_detect(self, upload_id: str):
         chapter_source = 'manual'
         logger.info(f'[Stage1] Manual fallback: {len(chapters)} chapters')
 
+    # ── Fix 4: AI Chapter Validation (non-manual paths only) ─────────────────
+    if chapter_source != 'manual':
+        upload.processing_stage = 'validating_chapters'
+        upload.save(update_fields=['processing_stage'])
+        chapters = _apply_ai_chapter_validation(chapters, pages, upload.title)
+        # If validation reduced to < 2 chapters, fall back to manual
+        if len(chapters) < 2:
+            chapters = build_manual_chapters(pages, pages_per_chapter=17)
+            chapter_source = 'manual'
+            logger.warning('[Stage1] Validation left < 2 chapters — using manual fallback')
+
     # Persist chapter_source on Book
     book.chapter_source = chapter_source
     book.save(update_fields=['chapter_source'])
@@ -425,8 +511,8 @@ def task_build_reading_schedule(self, book_id: str, user_id: int):
     pages = extract_text_from_pdf(pdf_path)
     pages_dict = {p['page_number']: p['text'] for p in pages}
 
-    daily_minutes = book.daily_minutes or 30
-    words_per_session = daily_minutes * 200  # e.g. 30 min × 200 wpm = 6,000 words/day
+    pages_per_day = book.daily_minutes or 30
+    words_per_session = pages_per_day * 200  # 200 wpm × daily_minutes
 
     schedule_data = []
     current_day = 1
@@ -458,9 +544,11 @@ def task_build_reading_schedule(self, book_id: str, user_id: int):
                 is_locked=False,
             )
 
-            # Split using daily reading target; merge tiny trailing chunks
+            # Split into page-sized chunks (~300 words = 1 page ≈ 1.5 min reading).
+            # day_number is assigned per-chunk sequentially so that TodayReadingView
+            # can slice pages_per_day chunks using positional indexing.
             raw_chunks = split_text_into_chunks(
-                chapter_text, words_per_chunk=words_per_session
+                chapter_text, words_per_chunk=300
             )
             chunks_text = _merge_small_chunks(raw_chunks, min_words=100)
 
@@ -538,12 +626,26 @@ def task_build_reading_schedule(self, book_id: str, user_id: int):
         f'{total_chunks_created} chunks for "{book.title}"'
     )
 
-    # Trigger Stage 4: Book Brief (then it triggers initial summaries)
+    # Trigger Stage 4 FIRST so it isn't blocked behind chunk-cleaning tasks in solo pool
     try:
         from apps.book_intelligence.tasks import generate_book_brief_task
         generate_book_brief_task.delay(str(profile.id), user_id)
     except Exception as exc:
         logger.warning(f'[Stage3] Could not queue book brief task: {exc}')
+
+    # Fix 5: Pre-clean the first day's chunks (queued AFTER brief so brief runs first)
+    try:
+        from apps.book_intelligence.tasks import task_clean_chunk
+        first_chunks = list(
+            Chunk.objects.filter(chapter__book=book)
+            .order_by('chapter__chapter_number', 'chunk_index')
+            [:(pages_per_day or 10)]
+        )
+        for chunk in first_chunks:
+            task_clean_chunk.delay(str(chunk.id))
+        logger.info(f'[Stage3] Queued cleaning for {len(first_chunks)} day-1 chunks')
+    except Exception as exc:
+        logger.warning(f'[Stage3] Could not queue chunk cleaning: {exc}')
 
 
 # ── Admin Book Processing (auto-confirm chapters) ────────────────────────────
@@ -636,6 +738,14 @@ def process_admin_book_pdf(self, book_id: str):
         chapters = build_manual_chapters(pages, pages_per_chapter=17)
         chapter_source = 'manual'
 
+    # ── Fix 4: AI Chapter Validation (non-manual paths only) ─────────────────
+    if chapter_source != 'manual':
+        chapters = _apply_ai_chapter_validation(chapters, pages, book.title)
+        if len(chapters) < 2:
+            chapters = build_manual_chapters(pages, pages_per_chapter=17)
+            chapter_source = 'manual'
+            logger.warning('[AdminPDF] Validation left < 2 chapters — using manual fallback')
+
     book.chapter_source = chapter_source
     book.save(update_fields=['chapter_source'])
 
@@ -663,13 +773,10 @@ def process_admin_book_pdf(self, book_id: str):
 
     # Build schedule immediately (admin books use default reading prefs)
     pages_dict = {p['page_number']: p['text'] for p in pages}
-    daily_minutes = book.daily_minutes or 30
-    words_per_session = daily_minutes * 200
-
     from apps.books.models import Chapter, Chunk
     with transaction.atomic():
         book.chapters.all().delete()
-        current_day = 1
+        current_chunk_number = 0
         total_chunks = 0
 
         for ai_ch in profile.ai_chapters.all().order_by('chapter_number'):
@@ -691,7 +798,11 @@ def process_admin_book_pdf(self, book_id: str):
                 is_locked=False,
             )
 
-            raw_chunks = split_text_into_chunks(chapter_text, words_per_chunk=words_per_session)
+            # Split into page-sized chunks (~300 words each ≈ 1 book page).
+            # day_number uses the global chunk position so TodayReadingView can
+            # slice pages_per_day chunks positionally (day_number doubles as
+            # a global sequence number here for ordering/reference).
+            raw_chunks = split_text_into_chunks(chapter_text, words_per_chunk=300)
             chunks_text = _merge_small_chunks(raw_chunks, min_words=100)
             if not chunks_text and chapter_text.strip():
                 chunks_text = [chapter_text.strip()]
@@ -701,15 +812,15 @@ def process_admin_book_pdf(self, book_id: str):
                 if not chunk_text:
                     continue
                 chunk_wc = len(chunk_text.split())
+                current_chunk_number += 1
                 Chunk.objects.create(
                     chapter=chapter,
                     chunk_index=i,
                     text=chunk_text,
                     estimated_minutes=max(1, round(chunk_wc / 200)),
-                    day_number=current_day,
+                    day_number=current_chunk_number,
                     words_count=chunk_wc,
                 )
-                current_day += 1
                 total_chunks += 1
 
         book.total_chapters = len(chapters)

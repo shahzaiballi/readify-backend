@@ -214,6 +214,10 @@ class Chunk(models.Model):
         default=0,
         help_text='Precomputed word count for scheduling calculations',
     )
+    is_cleaned = models.BooleanField(
+        default=False,
+        help_text='True once AI has removed OCR artifacts and PDF extraction noise from this chunk',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -359,6 +363,10 @@ class ReadingSchedule(models.Model):
         help_text='List of {day, chunk_ids, estimated_minutes, chapter_number, chapter_title}',
     )
     total_days = models.PositiveIntegerField(default=0)
+    current_day = models.PositiveIntegerField(
+        default=1,
+        help_text='Which reading day the user is currently on (advances after each session)',
+    )
     start_date = models.DateField(
         help_text='When the user started this reading plan',
     )

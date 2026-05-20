@@ -61,9 +61,37 @@ class LibraryView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Auto-create ReadingSchedule if the book has processed chunks
+        self._ensure_reading_schedule(request.user, book)
+
         return Response(
             LibraryBookSerializer(user_book, context={'request': request}).data,
             status=status.HTTP_201_CREATED
+        )
+
+    def _ensure_reading_schedule(self, user, book):
+        """Create a ReadingSchedule for the user+book if one doesn't exist and chunks are ready."""
+        from apps.books.models import ReadingSchedule, Chunk
+        from django.db.models import Max
+        from datetime import date
+
+        if ReadingSchedule.objects.filter(user=user, book=book).exists():
+            return
+
+        max_day = Chunk.objects.filter(
+            chapter__book=book
+        ).aggregate(max_day=Max('day_number'))['max_day']
+
+        if not max_day:
+            return
+
+        ReadingSchedule.objects.create(
+            user=user,
+            book=book,
+            total_days=max_day,
+            current_day=1,
+            start_date=date.today(),
+            schedule_data=[],
         )
 
 

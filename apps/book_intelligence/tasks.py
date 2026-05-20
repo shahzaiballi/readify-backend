@@ -277,6 +277,10 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
     chapter_title = ai_chapter.title
     word_count = len(chapter_text.split())
 
+    # Pull book type + complexity from the intelligence profile
+    book_type = ai_chapter.profile.book_type or 'other'
+    complexity_level = ai_chapter.profile.complexity_level or 'intermediate'
+
     try:
         if word_count <= 8000:
             # Short chapter: single AI call
@@ -285,6 +289,8 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
                 chapter_text=chapter_text,
                 mode=mode,
                 book_title=book_title,
+                book_type=book_type,
+                complexity_level=complexity_level,
             )
         else:
             # Long chapter: split into 6,000-word sections, summarise each, synthesise
@@ -305,6 +311,8 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
                     chapter_text=sec_text,
                     mode=mode,
                     book_title=book_title,
+                    book_type=book_type,
+                    complexity_level=complexity_level,
                 )
                 # Convert dict summary to string for synthesis input
                 import json as _json
@@ -323,6 +331,8 @@ def generate_chapter_intelligence_task(self, ai_chapter_id: str, mode: str):
                     chapter_text=' '.join(words[:6000]),
                     mode=mode,
                     book_title=book_title,
+                    book_type=book_type,
+                    complexity_level=complexity_level,
                 )
 
         ChapterIntelligence.objects.create(
@@ -353,9 +363,10 @@ def generate_initial_summaries_task(self, profile_id: str, user_id: int):
         return
 
     reading_mode = profile.book.reading_mode or 'deep'
-    first_three = profile.ai_chapters.order_by('chapter_number')[:3]
+    first_three = list(profile.ai_chapters.order_by('chapter_number')[:3])
 
     for ai_ch in first_three:
+        # Pre-generate the user's chosen reading mode
         if not ChapterIntelligence.objects.filter(
             ai_chapter=ai_ch, mode=reading_mode
         ).exists():
@@ -365,7 +376,61 @@ def generate_initial_summaries_task(self, profile_id: str, user_id: int):
                 f'"{ai_ch.title}"'
             )
 
+        # Always pre-generate exam mode (Q&A) regardless of reading_mode
+        if reading_mode != 'exam' and not ChapterIntelligence.objects.filter(
+            ai_chapter=ai_ch, mode='exam'
+        ).exists():
+            generate_chapter_intelligence_task.delay(str(ai_ch.id), 'exam')
+            logger.info(
+                f'[Intelligence] Queued exam/Q&A for Ch.{ai_ch.chapter_number} '
+                f'"{ai_ch.title}"'
+            )
+
+        # Always pre-generate flashcard mode (front/back cards) for chapters 1-3
+        if not ChapterIntelligence.objects.filter(
+            ai_chapter=ai_ch, mode='flashcard'
+        ).exists():
+            generate_chapter_intelligence_task.delay(str(ai_ch.id), 'flashcard')
+            logger.info(
+                f'[Intelligence] Queued flashcards for Ch.{ai_ch.chapter_number} '
+                f'"{ai_ch.title}"'
+            )
+
     logger.info(f'[Intelligence] ✅ Initial summary generation queued for {profile.book.title}')
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30, name='book_intelligence.task_clean_chunk')
+def task_clean_chunk(self, chunk_id: str):
+    """
+    Fix 5 — Chunk Text Cleaning.
+    Removes OCR artifacts (header/footer noise, broken hyphenation, stray page numbers)
+    from a single reading chunk. Runs once per chunk — idempotent via is_cleaned flag.
+    """
+    from apps.books.models import Chunk
+    from apps.book_intelligence.ai_client import clean_chunk_text
+
+    try:
+        chunk = Chunk.objects.get(id=chunk_id)
+    except Chunk.DoesNotExist:
+        logger.warning(f'[CleanChunk] Chunk {chunk_id} not found')
+        return
+
+    if chunk.is_cleaned:
+        logger.info(f'[CleanChunk] Chunk {chunk_id} already cleaned — skipping')
+        return
+
+    logger.info(f'[CleanChunk] Cleaning chunk {chunk_id} ({chunk.words_count} words)')
+
+    try:
+        cleaned = clean_chunk_text(chunk.text)
+        if cleaned and cleaned.strip() and cleaned != chunk.text:
+            chunk.text = cleaned
+        chunk.is_cleaned = True
+        chunk.save(update_fields=['text', 'is_cleaned'])
+        logger.info(f'[CleanChunk] ✅ Chunk {chunk_id} cleaned')
+    except Exception as exc:
+        logger.error(f'[CleanChunk] Failed for chunk {chunk_id}: {exc}', exc_info=True)
+        raise self.retry(exc=exc)
 
 
 @shared_task(bind=True, max_retries=2, name='book_intelligence.generate_daily_notifications')
