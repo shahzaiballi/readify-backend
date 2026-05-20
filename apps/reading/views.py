@@ -175,24 +175,20 @@ class InsightsView(APIView):
         )
         read_today_pages = sum(s.chunks_completed for s in today_sessions)
 
-        # 3. Day streak — count consecutive days with at least one session.
-        # Start from today if read today, otherwise from yesterday (preserve streak
-        # for users who haven't read yet today but have an active streak).
-        streak = 0
-        has_session_today = ReadingSession.objects.filter(
-            user_book__user=user, session_date=today
-        ).exists()
-        check_date = today if has_session_today else today - timedelta(days=1)
-        while True:
-            has_session = ReadingSession.objects.filter(
+        # 3. Day streak — single-query set-based calculation (P1 fix: replaces N+1 loop)
+        cutoff = today - timedelta(days=366)
+        session_dates = set(
+            ReadingSession.objects.filter(
                 user_book__user=user,
-                session_date=check_date
-            ).exists()
-            if has_session:
-                streak += 1
-                check_date -= timedelta(days=1)
-            else:
-                break
+                session_date__gte=cutoff,
+            ).values_list('session_date', flat=True).distinct()
+        )
+        # Start from today if read, otherwise from yesterday (preserve in-progress streak)
+        check_date = today if today in session_dates else today - timedelta(days=1)
+        streak = 0
+        while check_date in session_dates:
+            streak += 1
+            check_date -= timedelta(days=1)
 
         serializer = InsightsSerializer({
             'cardsDue': cards_due,

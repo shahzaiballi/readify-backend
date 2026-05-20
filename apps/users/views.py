@@ -168,10 +168,6 @@ class UserProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        if request.user.books_read >= 5 and not request.user.is_avid_reader:
-            request.user.is_avid_reader = True
-            request.user.save(update_fields=['is_avid_reader'])
-
         return Response(
             UserProfileSerializer(
                 request.user,
@@ -258,7 +254,8 @@ class ForgotPasswordView(APIView):
 
         PasswordResetOTP.objects.filter(user=user, is_used=False).delete()
 
-        code = str(random.randint(1000, 9999))
+        import secrets
+        code = str(secrets.randbelow(900000) + 100000)
         PasswordResetOTP.objects.create(user=user, code=code)
 
         send_mail(
@@ -297,7 +294,7 @@ class VerifyOTPView(APIView):
 
             return Response({'message': 'Verified'})
 
-        except:
+        except Exception:
             return Response({'error': 'Invalid'}, status=400)
 
 
@@ -333,7 +330,7 @@ class ResetPasswordView(APIView):
 
             return Response({'message': 'Password reset successful'})
 
-        except:
+        except Exception:
             return Response({'error': 'Invalid'}, status=400)
 
 
@@ -342,15 +339,26 @@ class UpdateStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
-        user.books_read += request.data.get('books_read_delta', 0)
-        user.total_pages_read += request.data.get('pages_read_delta', 0)
+        from django.db.models import F
+        books_delta = int(request.data.get('books_read_delta', 0))
+        pages_delta = int(request.data.get('pages_read_delta', 0))
 
-        if user.books_read >= 5:
-            user.is_avid_reader = True
+        # D4 fix: use F() expressions to avoid non-atomic read-modify-write race condition
+        update_fields = {}
+        if books_delta:
+            update_fields['books_read'] = F('books_read') + books_delta
+        if pages_delta:
+            update_fields['total_pages_read'] = F('total_pages_read') + pages_delta
 
-        user.save()
+        if update_fields:
+            type(request.user).objects.filter(pk=request.user.pk).update(**update_fields)
+
+        # Re-fetch fresh values and check avid reader badge
+        request.user.refresh_from_db()
+        if request.user.books_read >= 5 and not request.user.is_avid_reader:
+            request.user.is_avid_reader = True
+            request.user.save(update_fields=['is_avid_reader'])
 
         return Response(
-            UserProfileSerializer(user, context={'request': request}).data
+            UserProfileSerializer(request.user, context={'request': request}).data
         )

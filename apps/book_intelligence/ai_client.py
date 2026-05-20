@@ -34,11 +34,23 @@ def _get_client():
 
 
 def _parse_json_response(text: str) -> dict | list:
-    """Strip markdown fences and parse JSON."""
+    """Strip markdown fences and parse JSON. Falls back to partial-JSON repair on truncation."""
     text = text.strip()
-    text = re.sub(r'^```(?:json)?\s*', '', text)
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'\s*```$', '', text)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # DeepSeek may truncate mid-JSON when output hits max_tokens.
+        # Walk backwards from the last '}' or ']' to find the longest valid prefix.
+        for end_char in ('}', ']'):
+            pos = text.rfind(end_char)
+            while pos > 0:
+                try:
+                    return json.loads(text[:pos + 1])
+                except json.JSONDecodeError:
+                    pos = text.rfind(end_char, 0, pos)
+        raise
 
 
 def call_deepseek(prompt: str, max_tokens: int = 2048, temperature: float = 0.3) -> str:
@@ -381,7 +393,7 @@ Return ONLY valid JSON:
     }
 
     prompt = mode_prompts.get(mode, mode_prompts['skim'])
-    max_tokens_by_mode = {'skim': 128, 'concept': 1500, 'deep': 2500, 'exam': 2000, 'flashcard': 2000}
+    max_tokens_by_mode = {'skim': 128, 'concept': 1500, 'deep': 4000, 'exam': 2000, 'flashcard': 2000}
 
     try:
         raw = call_deepseek(prompt, max_tokens=max_tokens_by_mode.get(mode, 1500), temperature=0.3)

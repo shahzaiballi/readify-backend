@@ -48,7 +48,10 @@ class LibraryView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         book_id = serializer.validated_data['book_id']
-        book = Book.objects.get(id=book_id)
+        try:
+            book = Book.objects.get(id=book_id)
+        except Book.DoesNotExist:
+            return Response({'error': 'Book not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         user_book, created = UserBook.objects.get_or_create(
             user=request.user,

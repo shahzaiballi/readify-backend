@@ -367,6 +367,10 @@ class ReadingSchedule(models.Model):
         default=1,
         help_text='Which reading day the user is currently on (advances after each session)',
     )
+    pages_per_day = models.PositiveIntegerField(
+        default=10,
+        help_text='Chunks per reading session — stored at creation so both Today and Complete views use the same value',
+    )
     start_date = models.DateField(
         help_text='When the user started this reading plan',
     )

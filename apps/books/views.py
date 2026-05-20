@@ -389,16 +389,10 @@ class TodayReadingView(APIView):
         # Determine pages_per_day from user's reading plan
         from apps.reading.models import ReadingPlan
         reading_plan = getattr(request.user, 'reading_plan', None)
-        pages_per_day = reading_plan.pages_per_day if reading_plan else 10
+        plan_ppd = reading_plan.pages_per_day if reading_plan else 10
 
-        # Get all chunks for this book in reading order
-        all_chunks = list(
-            Chunk.objects
-            .filter(chapter__book=book)
-            .select_related('chapter')
-            .order_by('chapter__chapter_number', 'chunk_index')
-        )
-        total_chunks = len(all_chunks)
+        # Count chunks using a single COUNT query (P5 fix)
+        total_chunks = Chunk.objects.filter(chapter__book=book).count()
 
         if total_chunks == 0:
             return Response(
@@ -406,14 +400,18 @@ class TodayReadingView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Get or auto-create schedule
-        schedule = self._get_or_create_schedule(request.user, book, total_chunks, pages_per_day)
+        # Get or auto-create schedule (stores pages_per_day for L2 consistency)
+        schedule = self._get_or_create_schedule(request.user, book, total_chunks, plan_ppd)
+
+        # Always use the schedule's stored pages_per_day for slice consistency (L2)
+        pages_per_day = schedule.pages_per_day or plan_ppd
 
         total_days = ceil(total_chunks / pages_per_day)
-        # Update total_days if pages_per_day changed
-        if schedule.total_days != total_days:
+        # Update total_days and pages_per_day if reading plan changed
+        if schedule.total_days != total_days or schedule.pages_per_day != pages_per_day:
             schedule.total_days = total_days
-            schedule.save(update_fields=['total_days', 'updated_at'])
+            schedule.pages_per_day = pages_per_day
+            schedule.save(update_fields=['total_days', 'pages_per_day', 'updated_at'])
 
         # Book complete?
         if schedule.current_day > total_days:
@@ -430,10 +428,16 @@ class TodayReadingView(APIView):
                 'chapters': [],
             })
 
-        # Slice today's pages
+        # Slice today's pages using DB-level slicing (P5 fix — no full table load)
         start_idx = (schedule.current_day - 1) * pages_per_day
         end_idx = min(start_idx + pages_per_day, total_chunks)
-        todays_chunks = all_chunks[start_idx:end_idx]
+        todays_chunks = list(
+            Chunk.objects
+            .filter(chapter__book=book)
+            .select_related('chapter')
+            .order_by('chapter__chapter_number', 'chunk_index')
+            [start_idx:end_idx]
+        )
 
         # Group by chapter
         chapters_map = {}
@@ -462,16 +466,12 @@ class TodayReadingView(APIView):
         days_remaining = total_days - (schedule.current_day - 1)
         projected_finish = date.today() + timedelta(days=days_remaining)
 
-        # Already completed today?
-        from apps.reading.models import ReadingSession
+        # is_today_complete: False — after completing, current_day always points to the
+        # NEXT unread day. The Flutter controller handles the just-completed state locally.
+        # (B9 fix: old session-today check incorrectly returned True for unread new days)
         from apps.library.models import UserBook
         user_book = UserBook.objects.filter(user=request.user, book=book).first()
         is_today_complete = False
-        if user_book:
-            is_today_complete = ReadingSession.objects.filter(
-                user_book=user_book,
-                session_date=date.today(),
-            ).exists()
 
         return Response({
             'dayNumber': schedule.current_day,
@@ -490,7 +490,7 @@ class TodayReadingView(APIView):
         })
 
     def _get_or_create_schedule(self, user, book, total_chunks, pages_per_day):
-        """Return existing schedule or auto-create one."""
+        """Return existing schedule or auto-create one (stores pages_per_day for L2 fix)."""
         from math import ceil
         try:
             return ReadingSchedule.objects.get(user=user, book=book)
@@ -504,12 +504,13 @@ class TodayReadingView(APIView):
             defaults={'status': UserBook.Status.IN_PROGRESS},
         )
 
-        total_days = ceil(total_chunks / pages_per_day)
+        total_days = ceil(total_chunks / max(pages_per_day, 1))
         schedule = ReadingSchedule.objects.create(
             user=user,
             book=book,
             total_days=total_days,
             current_day=1,
+            pages_per_day=pages_per_day,
             start_date=date.today(),
             schedule_data=[],
         )
@@ -547,10 +548,10 @@ class TodayCompleteView(APIView):
 
         duration_seconds = request.data.get('duration_seconds', 0)
 
-        # Determine pages_per_day
+        # Use schedule's stored pages_per_day for slice consistency (L2 fix)
         from apps.reading.models import ReadingPlan, ReadingSession
         reading_plan = getattr(request.user, 'reading_plan', None)
-        pages_per_day = reading_plan.pages_per_day if reading_plan else 10
+        pages_per_day = schedule.pages_per_day or (reading_plan.pages_per_day if reading_plan else 10)
 
         # Total chunks in the book
         total_chunks = Chunk.objects.filter(chapter__book=book).count()
@@ -570,9 +571,29 @@ class TodayCompleteView(APIView):
         )
         todays_chunks = all_chunks[start_idx:end_idx]
 
+        # Idempotency guard (B8 fix): prevent double-submission advancing current_day twice
+        from apps.library.models import UserBook as _UB
+        _ub_check = _UB.objects.filter(user=request.user, book=book).first()
+        if _ub_check and ReadingSession.objects.filter(
+            user_book=_ub_check, session_date=date.today()
+        ).filter(
+            last_chunk__in=[c for c in todays_chunks]
+        ).exists():
+            return Response({
+                'progressPercent': _ub_check.progress_percent,
+                'pagesReadToday': pages_read_today,
+                'totalPagesRead': end_idx,
+                'totalPages': total_chunks,
+                'nextDayNumber': schedule.current_day,
+                'totalDays': schedule.total_days,
+                'daysRemaining': max(0, schedule.total_days - (schedule.current_day - 1)),
+                'milestone': None,
+                'isBookComplete': schedule.current_day > schedule.total_days,
+            })
+
         # Advance schedule
         schedule.current_day += 1
-        total_days = ceil(total_chunks / pages_per_day) if pages_per_day > 0 else 1
+        total_days = ceil(total_chunks / max(pages_per_day, 1))
         schedule.total_days = total_days
         schedule.save(update_fields=['current_day', 'total_days', 'updated_at'])
 
@@ -640,23 +661,22 @@ class TodayCompleteView(APIView):
         user_book.progress_percent = progress_percent
         user_book.save(update_fields=['progress_percent', 'status'])
 
-        # ── Update User reading stats ─────────────────────────────────────
+        # Update User reading stats ─────────────────────────────────────
         user = request.user
 
-        # Streak: count consecutive days ending today.
-        # We just created a session, so today always has one.
+        # Streak: single-query set-based calculation (P1 fix — replaces N+1 loop)
+        cutoff = date.today() - timedelta(days=366)
+        session_dates = set(
+            ReadingSession.objects.filter(
+                user_book__user=user,
+                session_date__gte=cutoff,
+            ).values_list('session_date', flat=True).distinct()
+        )
         streak = 0
         check_date = date.today()
-        while True:
-            has_session = ReadingSession.objects.filter(
-                user_book__user=user,
-                session_date=check_date,
-            ).exists()
-            if has_session:
-                streak += 1
-                check_date -= timedelta(days=1)
-            else:
-                break
+        while check_date in session_dates:
+            streak += 1
+            check_date -= timedelta(days=1)
         user.current_streak = streak
 
         # Total pages ever read
@@ -702,13 +722,14 @@ class TodayCompleteView(APIView):
 
 class TodaySummaryView(APIView):
     """
-    GET /api/v1/books/<book_id>/today/summary/
+    GET /api/v1/books/<book_id>/today/summary/?day=N
 
-    Returns the AI-generated summary for today's reading content
-    in the user's chosen reading mode (skim/concept/deep/exam).
+    Returns the AI-generated summary for a reading day's content.
+    Uses positional slicing — consistent with TodayReadingView.
+    Defaults to current_day-1 (the day just completed).
+    Accepts ?day=N to override (e.g. during reading, before completing).
 
-    If the summary hasn't been generated yet, triggers generation
-    and returns HTTP 202 with status="generating".
+    Fixes: B2 (wrong task args), B3 (AIChapter import), B4+B5 (day_number broken).
     """
     permission_classes = [IsAuthenticated]
 
@@ -724,23 +745,41 @@ class TodaySummaryView(APIView):
             return Response({'error': 'No reading schedule found.'}, status=status.HTTP_404_NOT_FOUND)
 
         reading_mode = book.reading_mode or 'deep'
+        pages_per_day = schedule.pages_per_day or 10
 
-        # Get which chapters today's chunks belong to
-        chapter_ids = (
+        # Determine which day to summarise (B4 fix: default to last completed day)
+        try:
+            target_day = int(request.query_params.get('day', schedule.current_day - 1))
+        except (ValueError, TypeError):
+            target_day = schedule.current_day - 1
+        target_day = max(1, target_day)
+
+        # Use positional slicing — same logic as TodayReadingView (B5 fix)
+        total_chunks = Chunk.objects.filter(chapter__book=book).count()
+        if total_chunks == 0:
+            return Response({'error': 'No reading content found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        start_idx = (target_day - 1) * pages_per_day
+        if start_idx >= total_chunks:
+            return Response({'error': 'No reading content found for that day.'}, status=status.HTTP_404_NOT_FOUND)
+        end_idx = min(start_idx + pages_per_day, total_chunks)
+
+        todays_chunks = list(
             Chunk.objects
-            .filter(chapter__book=book, day_number=schedule.current_day)
-            .values_list('chapter_id', flat=True)
-            .distinct()
+            .filter(chapter__book=book)
+            .select_related('chapter')
+            .order_by('chapter__chapter_number', 'chunk_index')
+            [start_idx:end_idx]
         )
-
+        chapter_ids = list({c.chapter_id for c in todays_chunks})
         if not chapter_ids:
-            return Response({'error': 'No reading content found for today.'}, status=status.HTTP_404_NOT_FOUND)
+            return Response({'error': 'No reading content found for that day.'}, status=status.HTTP_404_NOT_FOUND)
 
         chapters = Chapter.objects.filter(id__in=chapter_ids).order_by('chapter_number')
 
-        # Try to get ChapterIntelligence for each chapter
+        # Import correct model name (B3 fix: was AIChapter, correct is BookIntelligenceChapter)
         try:
-            from apps.book_intelligence.models import ChapterIntelligence, BookIntelligenceProfile, AIChapter
+            from apps.book_intelligence.models import ChapterIntelligence, BookIntelligenceChapter
             profile = book.intelligence_profile
         except Exception:
             return Response({'status': 'generating', 'summaries': []}, status=status.HTTP_202_ACCEPTED)
@@ -749,8 +788,11 @@ class TodaySummaryView(APIView):
         needs_generation = False
 
         for chapter in chapters:
+            ai_chapter = None
             try:
-                ai_chapter = AIChapter.objects.get(profile=profile, chapter_number=chapter.chapter_number)
+                ai_chapter = BookIntelligenceChapter.objects.get(
+                    profile=profile, chapter_number=chapter.chapter_number
+                )
                 intel = ChapterIntelligence.objects.get(ai_chapter=ai_chapter, mode=reading_mode)
                 summary_content, key_takeaways = _extract_summary_content(intel.content or {}, reading_mode)
                 summaries.append({
@@ -760,13 +802,15 @@ class TodaySummaryView(APIView):
                     'summaryContent': summary_content,
                     'keyTakeaways': key_takeaways,
                 })
-            except (ChapterIntelligence.DoesNotExist, AIChapter.DoesNotExist):
+            except (ChapterIntelligence.DoesNotExist, BookIntelligenceChapter.DoesNotExist):
                 needs_generation = True
-                try:
-                    from apps.book_intelligence.tasks import generate_chapter_intelligence_task
-                    generate_chapter_intelligence_task.delay(str(profile.id), chapter.chapter_number, reading_mode)
-                except Exception as e:
-                    logger.error(f"[TodaySummary] Failed to trigger generation: {e}")
+                if ai_chapter:
+                    try:
+                        # B2 fix: pass correct ai_chapter.id and mode (not profile.id + chapter_number)
+                        from apps.book_intelligence.tasks import generate_chapter_intelligence_task
+                        generate_chapter_intelligence_task.delay(str(ai_chapter.id), reading_mode)
+                    except Exception as gen_err:
+                        logger.error(f'[TodaySummary] Failed to trigger generation: {gen_err}')
 
         if needs_generation and not summaries:
             return Response({'status': 'generating', 'summaries': []}, status=status.HTTP_202_ACCEPTED)

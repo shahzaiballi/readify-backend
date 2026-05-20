@@ -259,8 +259,11 @@ def validate_chapter_structure(chapters: list[dict], total_pages: int) -> bool:
         )
         return False
 
-    # Minimum pages per chapter — anything shorter is likely front/back matter
-    MIN_CHAPTER_PAGES = 4
+    # Minimum pages per chapter — relative to average chapter length so short books
+    # (e.g. "The Art of War": 66 pages / 13 chapters ≈ 5 pg avg) are not penalised.
+    # Floor at 2 so single-page items (ToC, index pages) are still rejected.
+    avg_pages = total_pages / len(chapters) if total_pages > 0 else 10
+    MIN_CHAPTER_PAGES = max(2, int(avg_pages * 0.2))
 
     for i, ch in enumerate(chapters):
         sp = ch.get('start_page', 0)

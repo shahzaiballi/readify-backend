@@ -91,7 +91,7 @@ def classify_and_structure_book(self, book_id: str):
     #  this is a fallback for books processed via the legacy /analyze/ endpoint)
     if not profile.ai_chapters.exists():
         existing_chapters = list(chapters.values(
-            'chapter_number', 'title', 'page_range'
+            'chapter_number', 'title', 'page_range', 'start_page', 'end_page'
         ))
         with transaction.atomic():
             for ch in existing_chapters:
@@ -100,8 +100,8 @@ def classify_and_structure_book(self, book_id: str):
                     chapter_number=ch['chapter_number'],
                     defaults={
                         'title': ch['title'],
-                        'start_page': 1,
-                        'end_page': 17,
+                        'start_page': ch.get('start_page', 1),
+                        'end_page': ch.get('end_page', ch.get('start_page', 1)),
                         'page_range_display': ch.get('page_range', ''),
                         'user_confirmed': True,
                     },
@@ -144,8 +144,8 @@ def build_rag_embeddings_task(self, profile_id: str, book_id: str):
         logger.error(f'[Intelligence] RAG build failed: {exc}', exc_info=True)
         try:
             profile = BookIntelligenceProfile.objects.get(id=profile_id)
-            # Still mark READY even if embeddings fail — other features still work
-            profile.status = BookIntelligenceProfile.Status.READY
+            # B7 fix: mark FAILED (not READY) so retries don't short-circuit
+            profile.status = BookIntelligenceProfile.Status.FAILED
             profile.error_message = f'RAG embeddings failed: {exc}'
             profile.save(update_fields=['status', 'error_message'])
         except Exception:
