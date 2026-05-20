@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -e
 
+# Create superuser automatically if env vars are set (Render free tier has no shell)
+if [ -n "$SUPERUSER_EMAIL" ] && [ -n "$SUPERUSER_PASSWORD" ]; then
+    python manage.py shell -c "
+from django.contrib.auth import get_user_model
+User = get_user_model()
+if not User.objects.filter(email='$SUPERUSER_EMAIL').exists():
+    User.objects.create_superuser(email='$SUPERUSER_EMAIL', password='$SUPERUSER_PASSWORD', full_name='Admin')
+    print('Superuser created: $SUPERUSER_EMAIL')
+else:
+    print('Superuser already exists')
+"
+fi
+
 # Run Celery worker + beat combined in background
 celery -A config worker \
     --beat \
