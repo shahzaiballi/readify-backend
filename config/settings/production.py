@@ -4,12 +4,23 @@ DEBUG = False
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='').split(',')
 
+# ── Cloudinary app (must be in INSTALLED_APPS so SDK gets configured) ─────────
+INSTALLED_APPS += ['cloudinary_storage', 'cloudinary']
+
 # ── Whitenoise (static files — no nginx needed) ───────────────────────────────
 MIDDLEWARE.insert(1, 'whitenoise.middleware.WhiteNoiseMiddleware')
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
-# ── Cloudinary (media: PDFs + cover images) ───────────────────────────────────
-DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+# ── Storage backends (Django 4.2+ format) ─────────────────────────────────────
+STORAGES = {
+    'default': {
+        'BACKEND': 'cloudinary_storage.storage.MediaCloudinaryStorage',
+    },
+    'staticfiles': {
+        'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
+    },
+}
+
+# ── Cloudinary credentials ─────────────────────────────────────────────────────
 CLOUDINARY_STORAGE = {
     'CLOUD_NAME': config('CLOUDINARY_CLOUD_NAME', default=''),
     'API_KEY': config('CLOUDINARY_API_KEY', default=''),
