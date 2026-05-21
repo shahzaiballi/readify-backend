@@ -85,7 +85,7 @@ class BookAdmin(admin.ModelAdmin):
     ordering = ('-created_at',)
 
     # List view actions
-    actions = ['trigger_reprocessing', 'mark_as_recommended', 'unmark_as_recommended']
+    actions = ['trigger_reprocessing', 'mark_as_recommended', 'unmark_as_recommended', 'fix_stale_covers']
 
     # Form layout
     fieldsets = (
@@ -204,6 +204,29 @@ class BookAdmin(admin.ModelAdmin):
     def unmark_as_recommended(self, request, queryset):
         queryset.update(is_recommended=False)
         self.message_user(request, f'Removed {queryset.count()} book(s) from recommended.')
+
+    @admin.action(description='🖼 Fix stale cover images (clear local paths, use cover_image_url)')
+    def fix_stale_covers(self, request, queryset):
+        import re
+        stale_pattern = re.compile(r'^(books/)?covers/cover_[0-9a-f\-]+\.png$')
+        fixed = 0
+        for book in queryset:
+            stored_name = book.cover_image.name if book.cover_image else ''
+            if not stored_name or not stale_pattern.match(stored_name):
+                continue
+            book.cover_image = None
+            book.save(update_fields=['cover_image'])
+            if not book.cover_image_url:
+                try:
+                    from apps.books.cover_service import fetch_cover_image_url
+                    url = fetch_cover_image_url(title=book.title, author=book.author)
+                    if url:
+                        book.cover_image_url = url
+                        book.save(update_fields=['cover_image_url'])
+                except Exception:
+                    pass
+            fixed += 1
+        self.message_user(request, f'Fixed {fixed} book(s) with stale cover paths.')
 
 
 # ── Chapter Admin ─────────────────────────────────────────────────────────────
