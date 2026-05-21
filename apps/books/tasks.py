@@ -15,6 +15,7 @@ import re
 import logging
 from datetime import timezone, datetime
 from celery import shared_task
+from django.core.files.base import ContentFile
 from django.db import transaction
 from django.utils import timezone as dj_timezone
 
@@ -80,24 +81,26 @@ def split_text_into_chunks(text: str, words_per_chunk: int = 250) -> list[str]:
 
 # ── PDF Helpers ────────────────────────────────────────────────────────────────
 
-def extract_first_page_as_image(pdf_path: str) -> str:
-    """Extract the first page of a PDF as a cover image."""
+def extract_first_page_as_image(pdf_path: str) -> tuple:
+    """
+    Extract the first page of a PDF as a cover image.
+    Returns (filename: str, data: bytes) or ('', b'') on failure.
+    Caller must use ContentFile(data) to save through Django's storage backend.
+    """
     try:
         import fitz
         from PIL import Image
         import io
         import uuid
-        import os
-        from django.conf import settings
     except ImportError as e:
         logger.error(f"Required library not installed: {e}")
-        return ""
+        return "", b""
 
     try:
         doc = fitz.open(pdf_path)
         if len(doc) == 0:
             doc.close()
-            return ""
+            return "", b""
 
         page = doc[0]
         pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
@@ -115,23 +118,16 @@ def extract_first_page_as_image(pdf_path: str) -> str:
 
         doc.close()
 
-        covers_dir = os.path.join(settings.MEDIA_ROOT, 'books', 'covers')
-        os.makedirs(covers_dir, exist_ok=True)
-
+        buffer = io.BytesIO()
+        img.save(buffer, 'PNG')
+        buffer.seek(0)
         filename = f"cover_{uuid.uuid4()}.png"
-        filepath = os.path.join(covers_dir, filename)
-        img.save(filepath, 'PNG', quality=95)
-
-        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            relative_path = f"books/covers/{filename}"
-            logger.info(f"[PDF Cover] ✅ Extracted: {relative_path}")
-            return relative_path
-
-        return ""
+        logger.info(f"[PDF Cover] ✅ Extracted in-memory: {filename}")
+        return filename, buffer.getvalue()
 
     except Exception as exc:
         logger.warning(f"[PDF Cover] ❌ Failed: {exc}", exc_info=True)
-        return ""
+        return "", b""
 
 
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
@@ -330,9 +326,9 @@ def task_extract_and_detect(self, upload_id: str):
 
     # Extract cover if needed
     if not book.cover_image and not book.cover_image_url:
-        cover_path = extract_first_page_as_image(upload.pdf_file.path)
-        if cover_path:
-            book.cover_image = cover_path
+        filename, data = extract_first_page_as_image(upload.pdf_file.path)
+        if filename and data:
+            book.cover_image.save(filename, ContentFile(data), save=False)
             book.save(update_fields=['cover_image'])
 
     # Extract PDF text (all pages)
@@ -684,13 +680,13 @@ def process_admin_book_pdf(self, book_id: str):
 
     # Cover (safe now: status is PROCESSING, signal won't re-trigger)
     if not book.cover_image and not book.cover_image_url:
-        cover_path = extract_first_page_as_image(book.pdf_file.path)
-        if cover_path:
-            book.cover_image = cover_path
+        filename, data = extract_first_page_as_image(book.pdf_file.path)
+        if filename and data:
+            book.cover_image.save(filename, ContentFile(data), save=False)
             book.save(update_fields=['cover_image'])
         else:
             cover_url = fetch_cover_image_url(
-                title=book.title, author=book.author, pdf_path=book.pdf_file.path
+                title=book.title, author=book.author
             )
             if cover_url:
                 book.cover_image_url = cover_url

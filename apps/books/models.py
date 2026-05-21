@@ -154,10 +154,16 @@ class Book(models.Model):
     def get_cover_url(self):
         """
         Returns whichever cover is available.
-        Prefers uploaded file over URL (so admin can override the URL).
+        Prefers uploaded file (Cloudinary) over URL.
+        Falls back to cover_image_url when cover_image.url is a local /media/ path
+        (happens when Cloudinary is not configured or the file was stored locally).
         """
         if self.cover_image:
-            return self.cover_image.url
+            url = self.cover_image.url
+            if url and url.startswith('http'):
+                return url
+            # Local path — Cloudinary not configured or file stored pre-Cloudinary.
+            # Fall through to cover_image_url so the app always gets a working image.
         return self.cover_image_url or ''
 
     def formatted_readers_count(self):
