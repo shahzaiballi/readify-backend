@@ -207,15 +207,16 @@ class BookAdmin(admin.ModelAdmin):
 
     @admin.action(description='🖼 Fix stale cover images (clear local paths, use cover_image_url)')
     def fix_stale_covers(self, request, queryset):
-        import re
-        stale_pattern = re.compile(r'^(books/)?covers/cover_[0-9a-f\-]+\.png$')
         fixed = 0
         for book in queryset:
             stored_name = book.cover_image.name if book.cover_image else ''
-            if not stored_name or not stale_pattern.match(stored_name):
+            if not stored_name:
                 continue
-            book.cover_image = None
-            book.save(update_fields=['cover_image'])
+            # Any path under books/covers/ or covers/ was stored on local filesystem
+            # Only clear it if there is a cover_image_url fallback, so the app still shows something
+            is_local_path = stored_name.startswith('books/covers/') or stored_name.startswith('covers/')
+            if not is_local_path:
+                continue
             if not book.cover_image_url:
                 try:
                     from apps.books.cover_service import fetch_cover_image_url
@@ -225,6 +226,8 @@ class BookAdmin(admin.ModelAdmin):
                         book.save(update_fields=['cover_image_url'])
                 except Exception:
                     pass
+            book.cover_image = None
+            book.save(update_fields=['cover_image'])
             fixed += 1
         self.message_user(request, f'Fixed {fixed} book(s) with stale cover paths.')
 
